@@ -103,7 +103,7 @@ export class FileWatcherService extends EventEmitter {
     }
     
     // Skip watching entirely for very large directories to prevent EMFILE
-    if (stats.estimatedFileCount > 5000) {
+    if (stats.estimatedFileCount > 15000) {
       console.warn(`Directory too large (${stats.estimatedFileCount} files), skipping file watching for: ${dirPath}`);
       console.warn(`File watching disabled for large workspace. Use manual refresh or file operations will still work.`);
       
@@ -525,7 +525,7 @@ export class FileWatcherService extends EventEmitter {
     console.log(`Workspace analysis for ${dirPath}: ${stats.estimatedFileCount} estimated files`);
     
     // For very large workspaces, use even more conservative settings
-    if (stats.estimatedFileCount > 5000) {
+    if (stats.estimatedFileCount > 10000) {
       console.log(`Very large workspace detected, using slowest polling`);
       return {
         ...options,
