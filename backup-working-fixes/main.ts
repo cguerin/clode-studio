@@ -2,7 +2,7 @@ import { app, BrowserWindow, ipcMain, shell, dialog } from 'electron';
 import { fileURLToPath } from 'url';
 import { dirname, join } from 'path';
 import * as path from 'path';
-import { spawn, fork, ChildProcess } from 'child_process';
+import { spawn, ChildProcess } from 'child_process';
 import Store from 'electron-store';
 import * as pty from 'node-pty';
 import { FSWatcher, existsSync, readFileSync, writeFileSync, mkdirSync } from 'fs';
@@ -10,9 +10,8 @@ import * as fs from 'fs';
 import { readFile, mkdir } from 'fs/promises';
 import { watch as chokidarWatch } from 'chokidar';
 import { homedir } from 'os';
-import { createHash } from 'crypto';
 import { claudeCodeService } from './claude-sdk-service.js';
-import { workspaceContextManager } from './workspace-context-manager.js';
+import { lightweightContext } from './lightweight-context.js';
 import { contextOptimizer } from './context-optimizer.js';
 import { workspacePersistence } from './workspace-persistence.js';
 import { searchWithRipgrep } from './search-ripgrep.js';
@@ -30,7 +29,7 @@ import { SnapshotService } from './snapshot-service.js';
 import { setupGitTimelineHandlers } from './git-timeline-handlers.js';
 import { ghostTextService } from './ghost-text-service.js';
 // LocalDatabase removed - SQLite not actively used
-import { getModeManager, MainProcessMode } from './services/mode-config.js';
+import { getModeManager } from './services/mode-config.js';
 import { RemoteServer } from './services/remote-server.js';
 import { ClaudeSettingsManager } from './services/claude-settings-manager.js';
 import { CloudflareTunnel } from './services/cloudflare-tunnel.js';
@@ -39,107 +38,6 @@ import { RelayClient } from './services/relay-client.js';
 // Load environment variables from .env file
 import { config } from 'dotenv';
 config();
-
-// GLOBAL IPC FLOOD DETECTION: Track ALL webContents.send calls
-let globalIPCCount = 0;
-let lastIPCLogTime = 0;
-let ipcChannelCounts: { [channel: string]: number } = {};
-
-function setupGlobalIPCTracking(window: BrowserWindow) {
-  const originalSend = window.webContents.send.bind(window.webContents);
-  window.webContents.send = function(channel: string, ...args: any[]) {
-    globalIPCCount++;
-    ipcChannelCounts[channel] = (ipcChannelCounts[channel] || 0) + 1;
-    
-    const now = Date.now();
-    
-    // Log every 1000 messages or every 1 second for rapid detection
-    if (globalIPCCount % 1000 === 0 || (now - lastIPCLogTime > 1000)) {
-      const topChannels = Object.entries(ipcChannelCounts)
-        .sort(([,a], [,b]) => b - a)
-        .slice(0, 3)
-        .map(([ch, count]) => `${ch}:${count}`)
-        .join(', ');
-      console.warn(`[IPC FLOOD] Total: ${globalIPCCount}, Top: ${topChannels}`);
-      lastIPCLogTime = now;
-    }
-    
-    // Emergency brake for ANY IPC channel
-    if (globalIPCCount > 50000) {
-      console.error(`[EMERGENCY] Blocking ALL IPC after ${globalIPCCount}. Channel: ${channel}`);
-      return;
-    }
-    
-    // Detect specific channel flooding - but only block OUTPUT channels, not input
-    // SMART BLOCKING: Only block if channel is truly flooded AND we're in an infinite loop
-    if (ipcChannelCounts[channel] > 5000 && channel.includes('claude:output:')) {
-      // Extract instance ID from channel name
-      const instanceId = channel.split(':').pop();
-      if (instanceId && global.claudeMessageTracking) {
-        const tracking = global.claudeMessageTracking.get(instanceId);
-        // Only block if we're actually in an infinite loop, not just high activity
-        if (tracking && tracking.blocked && tracking.identicalCount > 10) {
-          console.error(`[CHANNEL FLOOD] Blocking OUTPUT channel ${channel} - infinite loop detected (${tracking.identicalCount} identical messages)`);
-          return;
-        } else {
-          // High message count but not an infinite loop - allow through with warning
-          console.warn(`[CHANNEL BUSY] High activity on ${channel} (${ipcChannelCounts[channel]} messages) but no infinite loop detected - allowing`);
-        }
-      }
-    }
-    
-    return originalSend(channel, ...args);
-  };
-}
-
-// Memory and error monitoring
-process.on('uncaughtException', async (error) => {
-  console.error('Uncaught Exception:', error);
-  
-  // Try to clean up and save state before crashing
-  try {
-    await workspaceContextManager.closeAllWorkspaces();
-  } catch (e) {
-    console.error('Error during emergency cleanup:', e);
-  }
-  
-  process.exit(1);
-});
-
-process.on('unhandledRejection', (reason, promise) => {
-  console.error('Unhandled Rejection at:', promise, 'reason:', reason);
-});
-
-// Monitor memory usage
-setInterval(() => {
-  const usage = process.memoryUsage();
-  const heapUsedMB = usage.heapUsed / 1024 / 1024;
-  
-  if (heapUsedMB > 6000) { // 6GB warning threshold
-    console.warn(`Main process high memory usage: ${heapUsedMB.toFixed(2)}MB`);
-    
-    // Emergency cleanup
-    try {
-      if (global.pendingClaudeOutput) {
-        global.pendingClaudeOutput.clear();
-        console.log('Cleared pending Claude output due to high memory usage');
-      }
-    } catch (error) {
-      console.error('Error during emergency memory cleanup:', error);
-    }
-  }
-}, 60000); // Check every minute
-
-// Extend global for pending output storage and message tracking
-declare global {
-  var pendingClaudeOutput: Map<string, string> | undefined;
-  var claudeMessageTracking: Map<string, {
-    messageHashes: Map<string, { count: number; firstSeen: number; lastSeen: number }>;
-    messageCount: number;
-    lastResetTime: number;
-    blocked: boolean;
-  }> | undefined;
-}
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -177,136 +75,15 @@ const worktreeManagers: Map<string, WorktreeManager> = new Map();
 const snapshotServices: Map<string, SnapshotService> = new Map();
 
 const isDev = process.env.NODE_ENV !== 'production';
-let nuxtURL = 'http://localhost:3000';
-let serverProcess: ChildProcess | null = null;
-
-// Start Nuxt server function
-const startNuxtServer = async (): Promise<void> => {
-  return new Promise((resolve, reject) => {
-    if (!app.isPackaged) {
-      // Development mode - server is already running via npm run dev
-      console.log('Development mode - using existing server');
-      setTimeout(resolve, 100);
-      return;
-    }
-
-    // Production mode - start the Nuxt server from extraResources
-    console.log('Starting Nuxt server in production...');
-    
-    // Get the path to the server in extraResources
-    const resourcesPath = process.resourcesPath;
-    const serverPath = join(resourcesPath, '.output', 'server', 'index.mjs');
-    
-    console.log('Server path:', serverPath);
-    
-    if (!existsSync(serverPath)) {
-      console.error('Server file not found at:', serverPath);
-      reject(new Error('Server file not found'));
-      return;
-    }
-
-    // Fork the server process
-    serverProcess = fork(serverPath, [], {
-      env: {
-        ...process.env,
-        PORT: '3000',
-        HOST: 'localhost',
-        NODE_ENV: 'production',
-        NITRO_PORT: '3000',
-        NITRO_HOST: 'localhost'
-      },
-      silent: true // Capture stdout/stderr
-    });
-
-    let serverStarted = false;
-
-    serverProcess.stdout?.on('data', (data) => {
-      const message = data.toString();
-      console.log('Nuxt:', message);
-      
-      // Check if server is ready
-      if (!serverStarted && (message.includes('3000') || message.includes('Listening') || message.includes('ready'))) {
-        serverStarted = true;
-        console.log('Nuxt server is ready!');
-        setTimeout(resolve, 500); // Give it a moment to stabilize
-      }
-    });
-
-    serverProcess.stderr?.on('data', (data) => {
-      console.error('Nuxt Error:', data.toString());
-    });
-
-    serverProcess.on('error', (error) => {
-      console.error('Failed to start Nuxt server:', error);
-      reject(error);
-    });
-
-    serverProcess.on('exit', (code) => {
-      console.log('Nuxt server exited with code:', code);
-    });
-
-    // Timeout fallback
-    setTimeout(() => {
-      if (!serverStarted) {
-        console.log('Server start timeout - proceeding anyway');
-        resolve();
-      }
-    }, 5000);
-  });
-};
-
-// Clean up server on quit
-app.on('before-quit', async (event) => {
-  event.preventDefault(); // Prevent immediate quit
-  
-  if (serverProcess) {
-    console.log('Stopping Nuxt server...');
-    serverProcess.kill();
-  }
-  
-  // Clean up all pending Claude output
-  if (global.pendingClaudeOutput && global.pendingClaudeOutput.size > 0) {
-    console.log('Cleaning up all pending Claude output...');
-    global.pendingClaudeOutput.clear();
-  }
-  
-  // Clean up workspace contexts
-  try {
-    await workspaceContextManager.shutdown();
-    console.log('Workspace context manager shut down');
-  } catch (error) {
-    console.error('Error shutting down workspace context manager:', error);
-  }
-  
-  app.quit(); // Now actually quit
-  
-  // Kill all Claude instances
-  claudeInstances.forEach((pty, instanceId) => {
-    console.log(`Killing Claude instance ${instanceId}`);
-    try {
-      pty.kill();
-    } catch (error) {
-      console.error(`Failed to kill Claude instance ${instanceId}:`, error);
-    }
-  });
-  claudeInstances.clear();
-});
+const nuxtURL = isDev ? 'http://localhost:3000' : `file://${join(__dirname, '../.output/public/index.html')}`;
 
 function createWindow() {
-  // Set up icon path
-  const iconPath = process.platform === 'darwin'
-    ? join(__dirname, '..', 'build', 'icon.icns')
-    : process.platform === 'win32'
-    ? join(__dirname, '..', 'build', 'icon.ico')
-    : join(__dirname, '..', 'build', 'icon.png');
-  
   mainWindow = new BrowserWindow({
     width: 1600,
     height: 1000,
     minWidth: 1200,
     minHeight: 800,
     title: 'Clode Studio',
-    icon: existsSync(iconPath) ? iconPath : undefined,
     webPreferences: {
       preload: join(__dirname, 'preload.js'),
       contextIsolation: true,
@@ -321,10 +98,6 @@ function createWindow() {
 
   mainWindow.loadURL(nuxtURL);
 
-  // Set up IPC flood detection immediately after window creation
-  setupGlobalIPCTracking(mainWindow);
-  console.log('[IPC TRACKING] Global IPC flood detection enabled');
-
   mainWindow.once('ready-to-show', () => {
     mainWindow?.show();
     if (isDev) {
@@ -334,20 +107,6 @@ function createWindow() {
     // Update remote server with new window reference if it exists
     if (remoteServer && mainWindow) {
       remoteServer.updateMainWindow(mainWindow);
-    }
-    
-    // Flush any pending Claude output
-    if (global.pendingClaudeOutput && global.pendingClaudeOutput.size > 0) {
-      console.log('Flushing pending Claude output to new window');
-      setTimeout(() => {
-        global.pendingClaudeOutput?.forEach((output, instanceId) => {
-          if (output && mainWindow && !mainWindow.isDestroyed()) {
-            console.log(`Flushing ${output.length} chars for instance ${instanceId}`);
-            mainWindow.webContents.send(`claude:output:${instanceId}`, output);
-          }
-        });
-        global.pendingClaudeOutput?.clear();
-      }, 1000); // Give renderer time to set up listeners
     }
   });
 
@@ -365,21 +124,6 @@ app.whenReady().then(async () => {
   // Log the current mode
  
   
-  // Start Nuxt server first (in production)
-  if (app.isPackaged) {
-    try {
-      console.log('Starting Nuxt server for production...');
-      await startNuxtServer();
-      console.log('Nuxt server started successfully');
-    } catch (error) {
-      console.error('Failed to start Nuxt server:', error);
-      // Optionally show error dialog and quit
-      dialog.showErrorBox('Server Error', 'Failed to start the application server. Please try again.');
-      app.quit();
-      return;
-    }
-  }
-  
   // Initialize all service managers (singletons)
   GitServiceManager.getInstance();
   WorktreeManagerGlobal.getInstance();
@@ -396,57 +140,7 @@ app.whenReady().then(async () => {
 
   createWindow();
   
-  // Set up periodic cleanup of orphaned pending output (every 5 minutes)
-  setInterval(() => {
-    if (global.pendingClaudeOutput && global.pendingClaudeOutput.size > 0) {
-      // Check for orphaned entries (instances that no longer exist)
-      const activeInstances = new Set(claudeInstances.keys());
-      let cleanedCount = 0;
-      
-      global.pendingClaudeOutput.forEach((output, instanceId) => {
-        if (!activeInstances.has(instanceId)) {
-          console.log(`Cleaning up orphaned pending output for ${instanceId}`);
-          global.pendingClaudeOutput?.delete(instanceId);
-          cleanedCount++;
-        }
-      });
-      
-      if (cleanedCount > 0) {
-        console.log(`Cleaned up ${cleanedCount} orphaned pending output entries`);
-      }
-    }
-  }, 5 * 60 * 1000); // 5 minutes
-  
-  // Check if hybrid mode was enabled in settings and auto-start it
-  const savedHybridMode = (store as any).get('hybridModeEnabled');
-  const savedRelayType = (store as any).get('relayType') || 'CLODE';
-  const savedCustomUrl = (store as any).get('customRelayUrl');
-  
-  if (savedHybridMode && !modeManager.isHybridMode()) {
-    console.log('[Main] Auto-starting hybrid mode from saved settings...');
-    console.log('[Main] Using saved relay type:', savedRelayType);
-    if (savedCustomUrl) {
-      console.log('[Main] Using custom relay URL:', savedCustomUrl);
-    }
-    
-    // Enable hybrid mode with saved relay type and custom URL
-    setTimeout(async () => {
-      try {
-        const result = await enableHybridMode(savedRelayType, savedCustomUrl);
-        if (result && result.success) {
-          console.log('[Main] Hybrid mode auto-started successfully');
-          // Notify the UI that hybrid mode is enabled
-          mainWindow?.webContents.send('hybrid-mode-enabled', { relayType: savedRelayType });
-        } else {
-          console.error('[Main] Failed to auto-start hybrid mode:', result?.error);
-        }
-      } catch (error) {
-        console.error('[Main] Error auto-starting hybrid mode:', error);
-      }
-    }, 3000); // Delay to ensure window is ready
-  }
-  
-  // Initialize remote server if in hybrid mode (from env var)
+  // Initialize remote server if in hybrid mode
   if (modeManager.isHybridMode() && mainWindow) {
     const config = modeManager.getConfig();
     remoteServer = new RemoteServer({
@@ -679,11 +373,11 @@ ipcMain.handle('claude:start', async (event, instanceId: string, workingDirector
     // Configure MCP server for this Claude instance
     await claudeSettingsManager.configureClodeIntegration(instanceId, workingDirectory);
     
-    // Detect Claude installation
+    // Clear cache and detect Claude installation fresh for each instance
+    ClaudeDetector.clearCache();
     const claudeInfo = await ClaudeDetector.detectClaude(workingDirectory);
 
     // Get the command configuration
-    // Claude starts in interactive mode by default when run without arguments
     const debugArgs = process.env.CLAUDE_DEBUG === 'true' ? ['--debug'] : [];
 
     let { command, args: commandArgs, useShell } = ClaudeDetector.getClaudeCommand(claudeInfo, debugArgs);
@@ -714,249 +408,47 @@ ipcMain.handle('claude:start', async (event, instanceId: string, workingDirector
     // Get the user's default shell
     const userShell = process.env.SHELL || '/bin/bash';
 
-    console.log('Spawning Claude with:', { command, commandArgs, useShell });
-    
-    // Add error handling for spawn
-    let claudePty;
-    try {
-      // PTY ISOLATION FIX: Create clean environment without TTY inheritance
-      const cleanEnv = {
-        // Essential system variables only
-        HOME: process.env.HOME,
-        USER: process.env.USER,
-        PATH: process.env.PATH,
-        LANG: process.env.LANG || 'en_US.UTF-8',
-        // Terminal settings for Claude display only
-        FORCE_COLOR: '1',
+    console.log(`[Claude PTY] Creating PTY for ${instanceId} with command:`, command, commandArgs);
+    const claudePty = pty.spawn(command, commandArgs, {
+      name: 'xterm-256color',
+      cols: 40,  // Start with smaller size that matches typical UI, will be resized by frontend
+      rows: 20,
+      cwd: workingDirectory,
+      env: {
+        ...process.env,
         TERM: 'xterm-256color',
-        SHELL: userShell,
-        // Claude-specific instance variables
+        FORCE_COLOR: '1',
+        HOME: process.env.HOME, // Ensure HOME is set so Claude can find ~/.claude/settings.json
+        USER: process.env.USER, // Ensure USER is set
+        SHELL: userShell, // Ensure SHELL is set
+        // Add instance-specific environment variables for hooks
         CLAUDE_INSTANCE_ID: instanceId,
-        CLAUDE_INSTANCE_NAME: instanceName || `Claude-${instanceId.slice(7, 15)}`,
+        CLAUDE_INSTANCE_NAME: instanceName || `Claude-${instanceId.slice(7, 15)}`, // Use provided name or short ID
         CLAUDE_IDE_INSTANCE: 'true',
-        // REMOVED: FORCE_TTY which caused external terminal bleeding
-      };
-
-      claudePty = pty.spawn(command, commandArgs, {
-        name: 'xterm-color',
-        cols: 80,
-        rows: 30,
-        cwd: workingDirectory,
-        env: cleanEnv, // Use clean isolated environment  
-        handleFlowControl: true
-      });
-    } catch (error) {
-      console.error('Failed to spawn Claude:', error);
-      mainWindow?.webContents.send('claude-error', {
-        instanceId,
-        error: `Failed to spawn Claude: ${error instanceof Error ? error.message : String(error)}`
-      });
-      return { success: false, error: error instanceof Error ? error.message : String(error) };
-    }
+        // Prevent Windsurf environment detection
+        WINDSURF_API_KEY: undefined,
+        CODEIUM_API_KEY: undefined,
+        VSCODE_PID: undefined,
+        VSCODE_CWD: undefined
+      }
+    });
+    console.log(`[Claude PTY] Created with PID:`, claudePty.pid);
 
 
     // Store this instance
     claudeInstances.set(instanceId, claudePty);
 
-    // Capture initial output for debugging
-    let initialOutput = '';
-    let outputTimer: NodeJS.Timeout | null = null;
-
-    // MEMORY LEAK FIX: Target ONLY the specific infinite loop issue, not normal keystrokes
-    let lastLargeMessage = '';
-    let largeMessageCount = 0;
-    let totalDataCount = 0;
-    let lastLogTime = 0;
-    const LARGE_MESSAGE_THRESHOLD = 50; // Lower threshold - track messages > 50 characters  
-    const MAX_IDENTICAL_LARGE_MESSAGES = 20; // Much more aggressive - block after 20 repeats
-    const LOG_INTERVAL = 5000; // Log at most every 5 seconds
-
     // Handle output from Claude
     claudePty.onData((data: string) => {
-      totalDataCount++;
-      
-      // EMERGENCY PROTECTION: Block runaway IPC regardless of message content
-      if (totalDataCount > 10000) { // Emergency brake at 10k messages
-        const now = Date.now();
-        if (now - lastLogTime > LOG_INTERVAL) {
-          console.error(`[EMERGENCY] Blocking Claude PTY after ${totalDataCount} messages for ${instanceId}`);
-          lastLogTime = now;
-        }
-        return; // Block all further messages after 10k
-      }
-      
-      // TARGETED PROTECTION: Only block large identical messages (the actual memory leak source)
-      if (data.length > LARGE_MESSAGE_THRESHOLD) {
-        if (data === lastLargeMessage) {
-          largeMessageCount++;
-          if (largeMessageCount > MAX_IDENTICAL_LARGE_MESSAGES) {
-            const now = Date.now();
-            // Only log occasionally to prevent log spam
-            if (now - lastLogTime > LOG_INTERVAL) {
-              console.warn(`[MEMORY LEAK FIX] Blocking large message loop for ${instanceId} - ${largeMessageCount} identical ${data.length}-char messages`);
-              lastLogTime = now;
-            }
-            return; // Block only large repeated messages
-          }
-        } else {
-          lastLargeMessage = data;
-          largeMessageCount = 0; // Reset counter on different large message
-        }
-      }
-      // NOTE: Small messages (keystrokes, prompts) are never blocked
-      
-      // Capture first few outputs for debugging (reduced logging)
-      if (initialOutput.length < 1000) {
-        initialOutput += data;
-        
-        // Log initial output after a short delay
-        if (outputTimer) clearTimeout(outputTimer);
-        outputTimer = setTimeout(() => {
-          if (initialOutput.trim()) {
-            console.log(`Initial Claude output for ${instanceId}:`, initialOutput);
-          }
-        }, 500);
-      }
-      
-      // Send data with instance ID to all windows (reduced logging)
-      const windows = BrowserWindow.getAllWindows();
-      
-      if (windows.length === 0) {
-        console.warn('No windows available to send Claude output to!');
-        // Store output to send when window becomes available
-        if (!global.pendingClaudeOutput) {
-          global.pendingClaudeOutput = new Map();
-        }
-        const pending = global.pendingClaudeOutput.get(instanceId) || '';
-        // MUCH SMALLER LIMIT to prevent memory explosion (1MB instead of 10MB)
-        const MAX_PENDING_SIZE = 1 * 1024 * 1024; // 1MB limit
-        const newPending = pending + data;
-        if (newPending.length > MAX_PENDING_SIZE) {
-          // Keep only the last portion of the output
-          global.pendingClaudeOutput.set(instanceId, newPending.slice(-MAX_PENDING_SIZE));
-          console.warn(`Pending output for ${instanceId} exceeded limit, truncating...`);
-        } else {
-          global.pendingClaudeOutput.set(instanceId, newPending);
-        }
-      } else {
-        // DEBUG: Log what's being sent to understand the massive memory usage
-        const dataSize = data.length;
-        const dataType = typeof data;
-        const dataPreview = data.length > 200 ? data.substring(0, 200) + '...[TRUNCATED]' : data;
-        
-        if (dataSize > 1000) {
-          console.warn(`[LARGE IPC] Sending ${dataSize} chars to ${instanceId}. Preview: ${JSON.stringify(dataPreview)}`);
-        }
-        
-        // AGGRESSIVE: Block much smaller messages due to "changes in size" issue
-        if (dataSize > 5000) { // 5KB limit - much more aggressive  
-          console.error(`[LARGE DATA BLOCK] Blocking ${dataSize} char message to prevent accumulation. Preview: ${JSON.stringify(dataPreview.substring(0, 100))}`);
-          return;
-        }
-        
-        // LIGHTWEIGHT: Simple rate limiting without expensive hashing
-        const now = Date.now();
-        
-        // Initialize per-instance tracking
-        if (!global.claudeMessageTracking) {
-          global.claudeMessageTracking = new Map();
-        }
-        
-        let tracking = global.claudeMessageTracking.get(instanceId);
-        if (!tracking) {
-          tracking = {
-            messageCount: 0,
-            lastResetTime: now,
-            blocked: false,
-            lastMessageContent: '',
-            identicalCount: 0
-          };
-          global.claudeMessageTracking.set(instanceId, tracking);
-        }
-        
-        // Reset counters every 30 seconds to allow recovery from blocks
-        if (now - tracking.lastResetTime > 30000) {
-          tracking.messageCount = 0;
-          tracking.lastResetTime = now;
-          tracking.blocked = false;
-          tracking.identicalCount = 0;
-          console.log(`[LOOP DETECTION] Reset tracking for ${instanceId}`);
-        }
-        
-        tracking.messageCount++;
-        
-        // IMPROVED INFINITE LOOP DETECTION: Check for repeated patterns
-        if (data === tracking.lastMessageContent) {
-          tracking.identicalCount++;
-          // Only block after many identical messages AND it's a tool result pattern
-          if (tracking.identicalCount > 20 && (
-            data.includes('⏵⏵ accept') || 
-            data.includes('bash run') ||
-            data.includes('Tool use:') ||
-            data.includes('MCP:')
-          )) {
-            console.error(`[INFINITE LOOP DETECTED] Tool result repeated ${tracking.identicalCount} times for ${instanceId}. Pattern: ${data.substring(0, 100)}`);
-            tracking.blocked = true;
-            return;
-          }
-        } else {
-          tracking.identicalCount = 0;
-          tracking.lastMessageContent = data;
-        }
-        
-        // SIMPLE RATE LIMITING: Block if too many messages per second
-        if (tracking.messageCount > 100) {
-          const timeWindow = now - tracking.lastResetTime;
-          const messagesPerSecond = (tracking.messageCount * 1000) / timeWindow;
-          if (messagesPerSecond > 50) {
-            console.error(`[RATE LIMIT] Blocking ${instanceId}: ${messagesPerSecond.toFixed(1)} msg/sec (limit: 50/sec)`);
-            tracking.blocked = true;
-            return;
-          }
-        }
-        
-        // Skip sending if instance is blocked
-        if (tracking.blocked) {
-          return;
-        }
-        
-        windows.forEach(window => {
-          if (!window.isDestroyed()) {
-            window.webContents.send(`claude:output:${instanceId}`, data);
-          }
-        });
-      }
+      console.log(`[Claude PTY ${instanceId}] Data:`, data.substring(0, 100));
+      // Send data with instance ID
+      mainWindow?.webContents.send(`claude:output:${instanceId}`, data);
     });
 
     // Handle exit
     claudePty.onExit(async ({ exitCode, signal }) => {
-      console.log(`Claude process exited for ${instanceId}:`, { exitCode, signal });
-      
-      // Log any captured output if process exits quickly
-      if (initialOutput.trim()) {
-        console.log(`Claude output before exit for ${instanceId}:`, initialOutput);
-      }
-      
-      // Clean up pending output for this instance to prevent memory leak
-      if (global.pendingClaudeOutput?.has(instanceId)) {
-        console.log(`Cleaning up pending output for ${instanceId}`);
-        global.pendingClaudeOutput.delete(instanceId);
-      }
-      
-      // Send exit event to all windows
-      const windows = BrowserWindow.getAllWindows();
-      windows.forEach(window => {
-        if (!window.isDestroyed()) {
-          window.webContents.send(`claude:exit:${instanceId}`, exitCode);
-        }
-      });
+      mainWindow?.webContents.send(`claude:exit:${instanceId}`, exitCode);
       claudeInstances.delete(instanceId);
-      
-      // Clean up message tracking for this instance to prevent memory leak
-      if (global.claudeMessageTracking?.has(instanceId)) {
-        console.log(`Cleaning up message tracking for exited instance ${instanceId}`);
-        global.claudeMessageTracking.delete(instanceId);
-      }
       
       // Clean up MCP server configuration
       try {
@@ -970,22 +462,12 @@ ipcMain.handle('claude:start', async (event, instanceId: string, workingDirector
       if (remoteServer) {
         remoteServer.broadcastClaudeInstancesUpdate();
       }
-      
-      // Broadcast the exit/disconnection
-      if (remoteServer) {
-        remoteServer.broadcastClaudeStatusUpdate(instanceId, 'disconnected');
-      }
     });
 
     // Notify all clients about instance update
     mainWindow?.webContents.send('claude:instances:updated');
     if (remoteServer) {
       remoteServer.broadcastClaudeInstancesUpdate();
-    }
-    
-    // Broadcast the successful start with PID
-    if (remoteServer) {
-      remoteServer.broadcastClaudeStatusUpdate(instanceId, 'connected', claudePty.pid);
     }
 
     return {
@@ -1025,27 +507,11 @@ ipcMain.handle('claude:stop', async (event, instanceId: string) => {
   if (claudePty) {
     claudePty.kill();
     claudeInstances.delete(instanceId);
-    // Clean up pending output for this instance
-    if (global.pendingClaudeOutput?.has(instanceId)) {
-      console.log(`Cleaning up pending output for stopped instance ${instanceId}`);
-      global.pendingClaudeOutput.delete(instanceId);
-    }
-    
-    // Clean up message tracking for this instance to prevent memory leak
-    if (global.claudeMessageTracking?.has(instanceId)) {
-      console.log(`Cleaning up message tracking for stopped instance ${instanceId}`);
-      global.claudeMessageTracking.delete(instanceId);
-    }
     
     // Notify all clients about instance update
     mainWindow?.webContents.send('claude:instances:updated');
     if (remoteServer) {
       remoteServer.broadcastClaudeInstancesUpdate();
-    }
-    
-    // Broadcast the disconnection
-    if (remoteServer) {
-      remoteServer.broadcastClaudeStatusUpdate(instanceId, 'disconnected');
     }
     
     return { success: true };
@@ -1089,31 +555,6 @@ ipcMain.handle('claude:resize', async (event, instanceId: string, cols: number, 
   return { success: false, error: `No Claude PTY running for instance ${instanceId}` };
 });
 
-// Recovery handler to unblock Claude instances
-ipcMain.handle('claude:unblock', async (event, instanceId: string) => {
-  if (!global.claudeMessageTracking) {
-    return { success: false, error: 'No tracking data available' };
-  }
-  
-  const tracking = global.claudeMessageTracking.get(instanceId);
-  if (tracking) {
-    // Reset all tracking data to unblock the instance
-    tracking.blocked = false;
-    tracking.messageCount = 0;
-    tracking.lastResetTime = Date.now();
-    
-    // Clear message hashes if they exist (for old MD5 approach)
-    if (tracking.messageHashes) {
-      tracking.messageHashes.clear();
-    }
-    
-    console.log(`[RECOVERY] Unblocked Claude instance ${instanceId}`);
-    return { success: true };
-  }
-  
-  return { success: false, error: `No tracking data for instance ${instanceId}` };
-});
-
 // Get home directory
 ipcMain.handle('getHomeDir', () => {
   return homedir();
@@ -1131,51 +572,26 @@ ipcMain.handle('showNotification', async (event, options: { title: string; body:
 // File Watcher operations
 ipcMain.handle('fileWatcher:start', async (event, dirPath: string, options?: any) => {
   try {
-    // Use VERY conservative settings to prevent EMFILE while still allowing functionality
-    console.log(`[Main] Starting conservative file watching for ${dirPath}`);
-    
-    const conservativeOptions = {
-      ...options,
-      usePolling: true, // Force polling to prevent EMFILE
-      interval: 3000, // Poll every 3 seconds
-      depth: 1, // Only watch top level
-      ignored: [
-        '**/node_modules/**',
-        '**/.git/**',
-        '**/dist/**',
-        '**/build/**',
-        '**/.cache/**'
-      ]
-    };
-    
-    await fileWatcherService.watchDirectory(dirPath, conservativeOptions);
+    await fileWatcherService.watchDirectory(dirPath, options);
 
-    // MEMORY LEAK FIX: Store listener references for proper cleanup
-    const fileChangeHandler = (data: any) => {
+    // Set up event forwarding to renderer
+    fileWatcherService.on('file:change', (data) => {
       const windows = BrowserWindow.getAllWindows();
       windows.forEach(window => {
         if (!window.isDestroyed()) {
           window.webContents.send('file:change', data);
         }
       });
-    };
+    });
 
-    const batchChangeHandler = (data: any) => {
+    fileWatcherService.on('batch:change', (data) => {
       const windows = BrowserWindow.getAllWindows();
       windows.forEach(window => {
         if (!window.isDestroyed()) {
           window.webContents.send('batch:change', data);
         }
       });
-    };
-
-    // Remove any existing listeners to prevent accumulation
-    fileWatcherService.removeAllListeners('file:change');
-    fileWatcherService.removeAllListeners('batch:change');
-
-    // Add new listeners
-    fileWatcherService.on('file:change', fileChangeHandler);
-    fileWatcherService.on('batch:change', batchChangeHandler);
+    });
 
     return { success: true };
   } catch (error) {
@@ -1196,63 +612,6 @@ ipcMain.handle('fileWatcher:indexFile', async (event, filePath: string) => {
   try {
     const result = await fileWatcherService.performIncrementalIndex(filePath, 'change');
     return { success: true, data: result };
-  } catch (error) {
-    return { success: false, error: error instanceof Error ? error.message : String(error) };
-  }
-});
-
-// GRACEFUL FALLBACK: IPC handlers for fallback mode
-ipcMain.handle('fileWatcher:getFallbackStatus', async (event) => {
-  try {
-    const status = fileWatcherService.getFallbackStatus();
-    return { success: true, data: status };
-  } catch (error) {
-    return { success: false, error: error instanceof Error ? error.message : String(error) };
-  }
-});
-
-ipcMain.handle('fileWatcher:resetFallback', async (event) => {
-  try {
-    fileWatcherService.resetFallbackMode();
-    return { success: true };
-  } catch (error) {
-    return { success: false, error: error instanceof Error ? error.message : String(error) };
-  }
-});
-
-// MANUAL REFRESH: IPC handlers for manual file system refresh
-ipcMain.handle('fileWatcher:manualRefresh', async (event, dirPath: string) => {
-  try {
-    const result = await fileWatcherService.manualRefresh(dirPath);
-    return { success: true, data: result };
-  } catch (error) {
-    return { success: false, error: error instanceof Error ? error.message : String(error) };
-  }
-});
-
-ipcMain.handle('fileWatcher:manualRefreshAll', async (event) => {
-  try {
-    const results = await fileWatcherService.manualRefreshAll();
-    return { success: true, data: results };
-  } catch (error) {
-    return { success: false, error: error instanceof Error ? error.message : String(error) };
-  }
-});
-
-// USER SETTINGS: IPC handlers for file watching configuration
-ipcMain.handle('fileWatcher:getConfiguration', async (event) => {
-  try {
-    const config = fileWatcherService.getWatchingConfiguration();
-    return { success: true, data: config };
-  } catch (error) {
-    return { success: false, error: error instanceof Error ? error.message : String(error) };
-  }
-});
-
-ipcMain.handle('fileWatcher:setConfiguration', async (event, config: { enabled?: boolean; strategy?: string }) => {
-  try {
-    fileWatcherService.setWatchingConfiguration(config as any);
-    return { success: true };
   } catch (error) {
     return { success: false, error: error instanceof Error ? error.message : String(error) };
   }
@@ -2541,18 +1900,8 @@ ipcMain.handle('lsp:checkCommand', async (event, command) => {
 // Code generation handler
 ipcMain.handle('codeGeneration:generate', async (event, { prompt, fileContent, filePath, language, resources = [] }) => {
   try {
-    // Import Claude SDK and detector
+    // Import Claude SDK
     const { query } = await import('@anthropic-ai/claude-code');
-    const { ClaudeDetector } = await import('./claude-detector.js');
-    
-    // Detect Claude installation
-    const claudeInfo = await ClaudeDetector.detectClaude();
-    if (!claudeInfo || !claudeInfo.path) {
-      return { 
-        success: false, 
-        error: 'Claude CLI not found. Please ensure Claude is installed.' 
-      };
-    }
     
     // Load resource contents
     const loadedResources = await Promise.all(resources.map(async (resource: any) => {
@@ -2615,7 +1964,7 @@ Remember: Return ONLY the complete code for the file. No explanations. No markdo
     }, 60000); // 60 second timeout
     
     try {
-      // Use Claude SDK to generate code with detected Claude path
+      // Use Claude SDK to generate code
       const response = query({
         prompt: userPrompt,
         options: {
@@ -2623,8 +1972,7 @@ Remember: Return ONLY the complete code for the file. No explanations. No markdo
           model: 'claude-sonnet-4-20250514', // Fast model for code generation
           maxTurns: 1,
           allowedTools: [],
-          customSystemPrompt: systemPrompt,
-          pathToClaudeCodeExecutable: claudeInfo.path
+          customSystemPrompt: systemPrompt
         }
       });
       
@@ -2696,22 +2044,6 @@ Remember: Return ONLY the complete code for the file. No explanations. No markdo
 
 // Clean up Claude instances on app quit
 app.on('before-quit', async () => {
-  // MEMORY LEAK FIX: Clean up all event listeners first
-  try {
-    fileWatcherService.removeAllListeners();
-    console.log('File watcher event listeners cleaned up');
-  } catch (error) {
-    console.error('Error cleaning up file watcher listeners:', error);
-  }
-  
-  // Shutdown file watchers
-  try {
-    await fileWatcherService.stopAll();
-    console.log('File watchers stopped successfully');
-  } catch (error) {
-    console.error('Failed to stop file watchers:', error);
-  }
-  
   // Shutdown LSP servers
   try {
     const { lspManager } = await import('./lsp-manager.js');
@@ -2745,24 +2077,11 @@ ipcMain.handle('mcp:list', async (event, workspacePath?: string) => {
 
     // Detect Claude to use the correct binary
     const claudeInfo = await ClaudeDetector.detectClaude(workspacePath);
-    
-    // Get the properly formatted command for running Claude with arguments
-    const { command, args, useShell } = ClaudeDetector.getClaudeCommand(claudeInfo, ['mcp', 'list']);
-    
-    // Build the full command string - when using shell, args[1] contains the actual command
-    let fullCommand;
-    if (useShell && args[0] === '-c') {
-      // The command is already properly formatted in args[1]
-      fullCommand = args[1];
-    } else {
-      // Direct command execution
-      fullCommand = `"${command}" ${args.map(arg => `"${arg}"`).join(' ')}`;
-    }
-    
-    const { stdout } = await execAsync(fullCommand, {
+    const claudeCommand = claudeInfo.path;
+
+    const { stdout } = await execAsync(`${claudeCommand} mcp list`, {
       cwd: workspacePath,
-      env: process.env,
-      timeout: 5000 // 5 second timeout
+      env: process.env
     });
 
     // Parse the text output
@@ -2805,37 +2124,7 @@ ipcMain.handle('mcp:list', async (event, workspacePath?: string) => {
     }
 
     return { success: true, servers };
-  } catch (error: any) {
-    // Check if it's a timeout error
-    if (error.code === 'ETIMEDOUT' || error.signal === 'SIGTERM' || error.killed) {
-      console.warn('MCP list command timed out - Claude CLI may not be responding');
-      return { 
-        success: true, 
-        servers: [],
-        warning: 'Claude CLI timed out - no MCP servers detected'
-      };
-    }
-    
-    // Check if it was interrupted (SIGINT)
-    if (error.signal === 'SIGINT') {
-      console.warn('MCP list command was interrupted');
-      return { 
-        success: true, 
-        servers: [],
-        warning: 'Command interrupted'
-      };
-    }
-    
-    // Check if Claude CLI is not properly configured
-    if (error.code === 127) {
-      console.warn('Claude CLI not found or not properly configured');
-      return { 
-        success: true, 
-        servers: [],
-        warning: 'Claude CLI not available'
-      };
-    }
-    
+  } catch (error) {
     console.error('Failed to list MCP servers:', error);
     return {
       success: false,
@@ -3045,15 +2334,7 @@ ipcMain.handle('mcp:test', async (event, config) => {
 // Lightweight Context Handlers
 ipcMain.handle('context:initialize', async (event, workspacePath: string) => {
   try {
-    const context = await workspaceContextManager.getOrCreateContext(workspacePath);
-    
-    // Set up file change notifications to frontend for this workspace
-    context.onFileChange((eventType, filePath) => {
-      if (mainWindow && !mainWindow.isDestroyed()) {
-        mainWindow.webContents.send('context:file-changed', { event: eventType, filePath });
-      }
-    });
-    
+    await lightweightContext.initialize(workspacePath);
     return { success: true };
   } catch (error) {
     return {
@@ -3065,11 +2346,7 @@ ipcMain.handle('context:initialize', async (event, workspacePath: string) => {
 
 ipcMain.handle('context:searchFiles', async (event, query: string, limit: number = 20) => {
   try {
-    const context = workspaceContextManager.getCurrentContext();
-    if (!context) {
-      return { success: false, error: 'No workspace context available' };
-    }
-    const results = await context.searchFiles(query, limit);
+    const results = await lightweightContext.searchFiles(query, limit);
     return { success: true, results };
   } catch (error) {
     return {
@@ -3081,11 +2358,7 @@ ipcMain.handle('context:searchFiles', async (event, query: string, limit: number
 
 ipcMain.handle('context:buildContext', async (event, query: string, workingFiles: string[], maxTokens: number = 2000) => {
   try {
-    const contextInstance = workspaceContextManager.getCurrentContext();
-    if (!contextInstance) {
-      return { success: false, error: 'No workspace context available' };
-    }
-    const context = await contextInstance.buildContext(query, workingFiles, maxTokens);
+    const context = await lightweightContext.buildContext(query, workingFiles, maxTokens);
     return { success: true, context };
   } catch (error) {
     return {
@@ -3097,11 +2370,7 @@ ipcMain.handle('context:buildContext', async (event, query: string, workingFiles
 
 ipcMain.handle('context:getStatistics', async (event) => {
   try {
-    const context = workspaceContextManager.getCurrentContext();
-    if (!context) {
-      return { success: false, error: 'No workspace context available' };
-    }
-    const statistics = context.getStatistics();
+    const statistics = lightweightContext.getStatistics();
     return { success: true, statistics };
   } catch (error) {
     return {
@@ -3113,11 +2382,7 @@ ipcMain.handle('context:getStatistics', async (event) => {
 
 ipcMain.handle('context:getFileContent', async (event, filePath: string) => {
   try {
-    const context = workspaceContextManager.getCurrentContext();
-    if (!context) {
-      return { success: false, error: 'No workspace context available' };
-    }
-    const content = await context.getFileContent(filePath);
+    const content = await lightweightContext.getFileContent(filePath);
     return { success: true, content };
   } catch (error) {
     return {
@@ -3129,11 +2394,7 @@ ipcMain.handle('context:getFileContent', async (event, filePath: string) => {
 
 ipcMain.handle('context:getRecentFiles', async (event, hours: number = 24) => {
   try {
-    const context = workspaceContextManager.getCurrentContext();
-    if (!context) {
-      return { success: false, error: 'No workspace context available' };
-    }
-    const files = context.getRecentFiles(hours);
+    const files = lightweightContext.getRecentFiles(hours);
     return { success: true, files };
   } catch (error) {
     return {
@@ -3145,11 +2406,7 @@ ipcMain.handle('context:getRecentFiles', async (event, hours: number = 24) => {
 
 ipcMain.handle('context:rescan', async (event) => {
   try {
-    const context = workspaceContextManager.getCurrentContext();
-    if (!context) {
-      return { success: false, error: 'No workspace context available' };
-    }
-    await context.scanWorkspace();
+    await lightweightContext.scanWorkspace();
     return { success: true };
   } catch (error) {
     return {
@@ -3161,11 +2418,7 @@ ipcMain.handle('context:rescan', async (event) => {
 
 ipcMain.handle('context:startWatching', async (event) => {
   try {
-    const context = workspaceContextManager.getCurrentContext();
-    if (!context) {
-      return { success: false, error: 'No workspace context available' };
-    }
-    context.startWatching();
+    lightweightContext.startWatching();
     return { success: true };
   } catch (error) {
     return {
@@ -3177,11 +2430,7 @@ ipcMain.handle('context:startWatching', async (event) => {
 
 ipcMain.handle('context:stopWatching', async (event) => {
   try {
-    const context = workspaceContextManager.getCurrentContext();
-    if (!context) {
-      return { success: false, error: 'No workspace context available' };
-    }
-    context.stopWatching();
+    lightweightContext.stopWatching();
     return { success: true };
   } catch (error) {
     return {
@@ -3191,62 +2440,12 @@ ipcMain.handle('context:stopWatching', async (event) => {
   }
 });
 
-// Memory leak detection and monitoring handlers
-ipcMain.handle('context:detectMemoryLeaks', async (event) => {
-  try {
-    const context = workspaceContextManager.getCurrentContext();
-    if (!context) {
-      return { success: false, error: 'No workspace context available' };
-    }
-    const leakReport = context.detectMemoryLeaks();
-    return { success: true, leakReport };
-  } catch (error) {
-    return {
-      success: false,
-      error: error instanceof Error ? error.message : 'Failed to detect memory leaks'
-    };
+// Set up file change notifications to frontend
+lightweightContext.onFileChange((event, filePath) => {
+  if (mainWindow) {
+    mainWindow.webContents.send('context:file-changed', { event, filePath });
   }
 });
-
-ipcMain.handle('context:getMemoryStats', async (event) => {
-  try {
-    const context = workspaceContextManager.getCurrentContext();
-    if (!context) {
-      return { success: false, error: 'No workspace context available' };
-    }
-    const memoryStats = context.getMemoryStats();
-    const managerStats = workspaceContextManager.getStats();
-    return { 
-      success: true, 
-      memoryStats,
-      managerStats
-    };
-  } catch (error) {
-    return {
-      success: false,
-      error: error instanceof Error ? error.message : 'Failed to get memory stats'
-    };
-  }
-});
-
-ipcMain.handle('context:forceCleanup', async (event) => {
-  try {
-    const context = workspaceContextManager.getCurrentContext();
-    if (!context) {
-      return { success: false, error: 'No workspace context available' };
-    }
-    const removedCount = context.forceCleanup();
-    return { success: true, removedCount };
-  } catch (error) {
-    return {
-      success: false,
-      error: error instanceof Error ? error.message : 'Failed to force cleanup'
-    };
-  }
-});
-
-// Set up file change notifications to frontend - handled by individual contexts now
-// This will be set up when workspaces are initialized
 
 // Context optimization handlers
 ipcMain.handle('context:analyzeUsage', async (event, messages: any[], currentContext: string) => {
@@ -3680,166 +2879,6 @@ ipcMain.handle('remote:persist-token', async (event, tokenData: any) => {
     console.error('Failed to persist token:', error);
     return false;
   }
-});
-
-// Function to enable hybrid mode
-async function enableHybridMode(selectedRelayType?: string, customRelayUrl?: string): Promise<{ success: boolean; message?: string; error?: string }> {
-  try {
-    // Check if already in hybrid mode
-    if (remoteServer && remoteServer.isRunning()) {
-      return { success: true, message: 'Hybrid mode already enabled' };
-    }
-    
-    // Update mode manager
-    modeManager.setMode(MainProcessMode.HYBRID);
-    
-    // Get configuration
-    const config = modeManager.getConfig();
-    
-    // Start remote server
-    if (mainWindow) {
-      remoteServer = new RemoteServer({
-        config,
-        mainWindow
-      });
-      
-      await remoteServer.start();
-      
-      // Use selected relay type from UI, fallback to env var, then default to CLODE
-      const relayType = (selectedRelayType || process.env.RELAY_TYPE || 'CLODE').toUpperCase();
-      
-      if (relayType === 'CLODE' || relayType === 'TRUE') {
-        // Start Clode relay client
-        if (!relayClient) {
-          // Use custom URL if provided, otherwise use env var or default
-          const relayUrl = customRelayUrl || process.env.RELAY_URL || 'wss://relay.clode.studio';
-          relayClient = new RelayClient(relayUrl);
-          
-          relayClient.on('registered', (info) => {
-            console.log(`[Main] Clode Relay registered: ${info.url}`);
-            mainWindow?.webContents.send('relay:connected', info);
-          });
-          
-          relayClient.on('reconnected', () => {
-            console.log('[Main] Clode Relay reconnected');
-            mainWindow?.webContents.send('relay:reconnected');
-          });
-          
-          relayClient.on('connection_lost', () => {
-            console.log('[Main] Clode Relay connection lost');
-            mainWindow?.webContents.send('relay:disconnected');
-          });
-        }
-        
-        // Connect to relay
-        try {
-          const info = await relayClient.connect();
-          console.log(`[Main] Connected to Clode Relay: ${info.url}`);
-          (global as any).__relayClient = relayClient;
-        } catch (error) {
-          console.error('[Main] Failed to connect to Clode Relay:', error);
-          // Continue without relay - fallback to local network
-        }
-      } else if (relayType === 'CLOUDFLARE') {
-        // Start Cloudflare tunnel
-        if (!cloudflareTunnel) {
-          cloudflareTunnel = new CloudflareTunnel();
-        }
-        
-        try {
-          const url = await cloudflareTunnel.start();
-          console.log(`[Main] Cloudflare tunnel started: ${url}`);
-          mainWindow?.webContents.send('tunnel:connected', { url });
-        } catch (error) {
-          console.error('[Main] Failed to start Cloudflare tunnel:', error);
-        }
-      } else if (relayType === 'CUSTOM') {
-        // Custom tunnel - user needs to set it up
-        console.log('[Main] Custom tunnel mode - user needs to set up their own tunnel');
-        mainWindow?.webContents.send('tunnel:custom', {
-          message: 'Please set up your custom tunnel to expose port 3000',
-          port: 3000
-        });
-      } else if (relayType === 'NONE') {
-        // No tunnel - local network only
-        console.log('[Main] No tunnel mode - local network access only');
-        console.log('[Main] UI available at http://localhost:3000');
-        console.log('[Main] Remote server available at http://localhost:' + config.serverPort);
-        setTimeout(() => {
-          mainWindow?.webContents.send('tunnel:local-only', {
-            port: 3000,
-            serverPort: config.serverPort,
-          });
-        }, 1000);
-      }
-      // Default: no additional setup needed
-      
-      return { success: true, message: 'Hybrid mode enabled successfully' };
-    } else {
-      return { success: false, error: 'Main window not available' };
-    }
-  } catch (error) {
-    console.error('Failed to enable hybrid mode:', error);
-    return { 
-      success: false, 
-      error: error instanceof Error ? error.message : 'Unknown error' 
-    };
-  }
-}
-
-// IPC handler for enabling hybrid mode
-ipcMain.handle('remote:enable-hybrid-mode', async (event, options?: any) => {
-  // Support both old string format and new options object
-  if (typeof options === 'string') {
-    return enableHybridMode(options);
-  }
-  return enableHybridMode(options?.relayType, options?.customUrl);
-});
-
-ipcMain.handle('remote:disable-hybrid-mode', async () => {
-  try {
-    // Check if hybrid mode is enabled
-    if (!remoteServer || !remoteServer.isRunning()) {
-      return { success: true, message: 'Hybrid mode already disabled' };
-    }
-    
-    // Stop remote server
-    await remoteServer.stop();
-    remoteServer = null;
-    
-    // Stop relay client if running
-    if (relayClient && relayClient.isConnected()) {
-      relayClient.disconnect();
-      relayClient = null;
-    }
-    
-    // Stop cloudflare tunnel if running
-    if (cloudflareTunnel && cloudflareTunnel.isRunning()) {
-      cloudflareTunnel.stop();
-      cloudflareTunnel = null;
-    }
-    
-    // Update mode manager
-    modeManager.setMode(MainProcessMode.DESKTOP);
-    
-    return { success: true, message: 'Hybrid mode disabled successfully' };
-  } catch (error) {
-    console.error('Failed to disable hybrid mode:', error);
-    return { 
-      success: false, 
-      error: error instanceof Error ? error.message : 'Unknown error' 
-    };
-  }
-});
-
-ipcMain.handle('remote:get-mode-status', async () => {
-  return {
-    mode: modeManager.getMode(),
-    isHybrid: modeManager.isHybridMode(),
-    isRemoteEnabled: modeManager.isRemoteEnabled(),
-    serverRunning: remoteServer ? remoteServer.isRunning() : false,
-    config: modeManager.getConfig()
-  };
 });
 
 // Local Database handlers removed - SQLite not actively used

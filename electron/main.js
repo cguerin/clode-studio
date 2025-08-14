@@ -33,6 +33,39 @@ import { RelayClient } from './services/relay-client.js';
 // Load environment variables from .env file
 import { config } from 'dotenv';
 config();
+// GLOBAL IPC FLOOD DETECTION: Track ALL webContents.send calls
+let globalIPCCount = 0;
+let lastIPCLogTime = 0;
+let ipcChannelCounts = {};
+function setupGlobalIPCTracking(window) {
+    const originalSend = window.webContents.send.bind(window.webContents);
+    window.webContents.send = function (channel, ...args) {
+        globalIPCCount++;
+        ipcChannelCounts[channel] = (ipcChannelCounts[channel] || 0) + 1;
+        const now = Date.now();
+        // Log every 1000 messages or every 1 second for rapid detection
+        if (globalIPCCount % 1000 === 0 || (now - lastIPCLogTime > 1000)) {
+            const topChannels = Object.entries(ipcChannelCounts)
+                .sort(([, a], [, b]) => b - a)
+                .slice(0, 3)
+                .map(([ch, count]) => `${ch}:${count}`)
+                .join(', ');
+            console.warn(`[IPC FLOOD] Total: ${globalIPCCount}, Top: ${topChannels}`);
+            lastIPCLogTime = now;
+        }
+        // Emergency brake for ANY IPC channel
+        if (globalIPCCount > 50000) {
+            console.error(`[EMERGENCY] Blocking ALL IPC after ${globalIPCCount}. Channel: ${channel}`);
+            return;
+        }
+        // Detect specific channel flooding - but only block OUTPUT channels, not input
+        if (ipcChannelCounts[channel] > 5000 && channel.includes('claude:output:')) {
+            console.error(`[CHANNEL FLOOD] Blocking OUTPUT channel ${channel} after ${ipcChannelCounts[channel]} messages`);
+            return;
+        }
+        return originalSend(channel, ...args);
+    };
+}
 // Memory and error monitoring
 process.on('uncaughtException', async (error) => {
     console.error('Uncaught Exception:', error);
@@ -214,6 +247,9 @@ function createWindow() {
         show: false
     });
     mainWindow.loadURL(nuxtURL);
+    // Set up IPC flood detection immediately after window creation
+    setupGlobalIPCTracking(mainWindow);
+    console.log('[IPC TRACKING] Global IPC flood detection enabled');
     mainWindow.once('ready-to-show', () => {
         mainWindow?.show();
         if (isDev) {
@@ -553,25 +589,29 @@ ipcMain.handle('claude:start', async (event, instanceId, workingDirectory, insta
         // Add error handling for spawn
         let claudePty;
         try {
+            // PTY ISOLATION FIX: Create clean environment without TTY inheritance
+            const cleanEnv = {
+                // Essential system variables only
+                HOME: process.env.HOME,
+                USER: process.env.USER,
+                PATH: process.env.PATH,
+                LANG: process.env.LANG || 'en_US.UTF-8',
+                // Terminal settings for Claude display only
+                FORCE_COLOR: '1',
+                TERM: 'xterm-256color',
+                SHELL: userShell,
+                // Claude-specific instance variables
+                CLAUDE_INSTANCE_ID: instanceId,
+                CLAUDE_INSTANCE_NAME: instanceName || `Claude-${instanceId.slice(7, 15)}`,
+                CLAUDE_IDE_INSTANCE: 'true',
+                // REMOVED: FORCE_TTY which caused external terminal bleeding
+            };
             claudePty = pty.spawn(command, commandArgs, {
                 name: 'xterm-color',
                 cols: 80,
                 rows: 30,
                 cwd: workingDirectory,
-                env: {
-                    ...process.env,
-                    FORCE_COLOR: '1',
-                    TERM: 'xterm-256color',
-                    HOME: process.env.HOME, // Ensure HOME is set so Claude can find ~/.claude/settings.json
-                    USER: process.env.USER, // Ensure USER is set
-                    SHELL: userShell, // Ensure SHELL is set
-                    // Add instance-specific environment variables for hooks
-                    CLAUDE_INSTANCE_ID: instanceId,
-                    CLAUDE_INSTANCE_NAME: instanceName || `Claude-${instanceId.slice(7, 15)}`, // Use provided name or short ID
-                    CLAUDE_IDE_INSTANCE: 'true',
-                    // Force PTY mode to ensure Claude uses the PTY for I/O
-                    FORCE_TTY: '1'
-                },
+                env: cleanEnv, // Use clean isolated environment  
                 handleFlowControl: true
             });
         }
@@ -593,12 +633,21 @@ ipcMain.handle('claude:start', async (event, instanceId, workingDirectory, insta
         let largeMessageCount = 0;
         let totalDataCount = 0;
         let lastLogTime = 0;
-        const LARGE_MESSAGE_THRESHOLD = 200; // Only track messages > 200 characters
-        const MAX_IDENTICAL_LARGE_MESSAGES = 100; // Allow many more before blocking
+        const LARGE_MESSAGE_THRESHOLD = 50; // Lower threshold - track messages > 50 characters  
+        const MAX_IDENTICAL_LARGE_MESSAGES = 20; // Much more aggressive - block after 20 repeats
         const LOG_INTERVAL = 5000; // Log at most every 5 seconds
         // Handle output from Claude
         claudePty.onData((data) => {
             totalDataCount++;
+            // EMERGENCY PROTECTION: Block runaway IPC regardless of message content
+            if (totalDataCount > 10000) { // Emergency brake at 10k messages
+                const now = Date.now();
+                if (now - lastLogTime > LOG_INTERVAL) {
+                    console.error(`[EMERGENCY] Blocking Claude PTY after ${totalDataCount} messages for ${instanceId}`);
+                    lastLogTime = now;
+                }
+                return; // Block all further messages after 10k
+            }
             // TARGETED PROTECTION: Only block large identical messages (the actual memory leak source)
             if (data.length > LARGE_MESSAGE_THRESHOLD) {
                 if (data === lastLargeMessage) {
@@ -653,6 +702,71 @@ ipcMain.handle('claude:start', async (event, instanceId, workingDirectory, insta
                 }
             }
             else {
+                // DEBUG: Log what's being sent to understand the massive memory usage
+                const dataSize = data.length;
+                const dataType = typeof data;
+                const dataPreview = data.length > 200 ? data.substring(0, 200) + '...[TRUNCATED]' : data;
+                if (dataSize > 1000) {
+                    console.warn(`[LARGE IPC] Sending ${dataSize} chars to ${instanceId}. Preview: ${JSON.stringify(dataPreview)}`);
+                }
+                // AGGRESSIVE: Block much smaller messages due to "changes in size" issue
+                if (dataSize > 5000) { // 5KB limit - much more aggressive  
+                    console.error(`[LARGE DATA BLOCK] Blocking ${dataSize} char message to prevent accumulation. Preview: ${JSON.stringify(dataPreview.substring(0, 100))}`);
+                    return;
+                }
+                // LIGHTWEIGHT: Simple rate limiting without expensive hashing
+                const now = Date.now();
+                // Initialize per-instance tracking
+                if (!global.claudeMessageTracking) {
+                    global.claudeMessageTracking = new Map();
+                }
+                let tracking = global.claudeMessageTracking.get(instanceId);
+                if (!tracking) {
+                    tracking = {
+                        messageCount: 0,
+                        lastResetTime: now,
+                        blocked: false,
+                        lastMessageContent: '',
+                        identicalCount: 0
+                    };
+                    global.claudeMessageTracking.set(instanceId, tracking);
+                }
+                // Reset counters every 30 seconds to allow recovery from blocks
+                if (now - tracking.lastResetTime > 30000) {
+                    tracking.messageCount = 0;
+                    tracking.lastResetTime = now;
+                    tracking.blocked = false;
+                    tracking.identicalCount = 0;
+                    console.log(`[LOOP DETECTION] Reset tracking for ${instanceId}`);
+                }
+                tracking.messageCount++;
+                // SIMPLE INFINITE LOOP DETECTION: Check if identical to last message
+                if (data === tracking.lastMessageContent) {
+                    tracking.identicalCount++;
+                    if (tracking.identicalCount > 10) {
+                        console.error(`[INFINITE LOOP DETECTED] Identical message repeated ${tracking.identicalCount} times for ${instanceId}`);
+                        tracking.blocked = true;
+                        return;
+                    }
+                }
+                else {
+                    tracking.identicalCount = 0;
+                    tracking.lastMessageContent = data;
+                }
+                // SIMPLE RATE LIMITING: Block if too many messages per second
+                if (tracking.messageCount > 100) {
+                    const timeWindow = now - tracking.lastResetTime;
+                    const messagesPerSecond = (tracking.messageCount * 1000) / timeWindow;
+                    if (messagesPerSecond > 50) {
+                        console.error(`[RATE LIMIT] Blocking ${instanceId}: ${messagesPerSecond.toFixed(1)} msg/sec (limit: 50/sec)`);
+                        tracking.blocked = true;
+                        return;
+                    }
+                }
+                // Skip sending if instance is blocked
+                if (tracking.blocked) {
+                    return;
+                }
                 windows.forEach(window => {
                     if (!window.isDestroyed()) {
                         window.webContents.send(`claude:output:${instanceId}`, data);
@@ -680,6 +794,11 @@ ipcMain.handle('claude:start', async (event, instanceId, workingDirectory, insta
                 }
             });
             claudeInstances.delete(instanceId);
+            // Clean up message tracking for this instance to prevent memory leak
+            if (global.claudeMessageTracking?.has(instanceId)) {
+                console.log(`Cleaning up message tracking for exited instance ${instanceId}`);
+                global.claudeMessageTracking.delete(instanceId);
+            }
             // Clean up MCP server configuration
             try {
                 await claudeSettingsManager.cleanupClodeIntegration();
@@ -746,6 +865,11 @@ ipcMain.handle('claude:stop', async (event, instanceId) => {
             console.log(`Cleaning up pending output for stopped instance ${instanceId}`);
             global.pendingClaudeOutput.delete(instanceId);
         }
+        // Clean up message tracking for this instance to prevent memory leak
+        if (global.claudeMessageTracking?.has(instanceId)) {
+            console.log(`Cleaning up message tracking for stopped instance ${instanceId}`);
+            global.claudeMessageTracking.delete(instanceId);
+        }
         // Notify all clients about instance update
         mainWindow?.webContents.send('claude:instances:updated');
         if (remoteServer) {
@@ -793,6 +917,24 @@ ipcMain.handle('claude:resize', async (event, instanceId, cols, rows) => {
         }
     }
     return { success: false, error: `No Claude PTY running for instance ${instanceId}` };
+});
+// Recovery handler to unblock Claude instances
+ipcMain.handle('claude:unblock', async (event, instanceId) => {
+    if (!global.claudeMessageTracking) {
+        return { success: false, error: 'No tracking data available' };
+    }
+    const tracking = global.claudeMessageTracking.get(instanceId);
+    if (tracking) {
+        // Reset all tracking data to unblock the instance
+        tracking.blocked = false;
+        tracking.messageCount = 0;
+        tracking.identicalCount = 0;
+        tracking.lastResetTime = Date.now();
+        tracking.lastMessageContent = '';
+        console.log(`[RECOVERY] Unblocked Claude instance ${instanceId}`);
+        return { success: true };
+    }
+    return { success: false, error: `No tracking data for instance ${instanceId}` };
 });
 // Get home directory
 ipcMain.handle('getHomeDir', () => {

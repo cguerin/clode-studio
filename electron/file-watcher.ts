@@ -73,8 +73,10 @@ export class FileWatcherService extends EventEmitter {
     dirPath: string,
     options: WatcherOptions = {}
   ): Promise<void> {
-    // CONSERVATIVE FILE WATCHING: Claude PTY memory leak is now fixed, re-enabling safe file watching
-    console.log(`[FileWatcher] Starting conservative file watching for: ${dirPath}`);
+    // EMERGENCY: Memory leak returned - completely disable file watching again
+    console.log(`[EMERGENCY] File watching DISABLED - memory leak returned, isolating source`);
+    this.emit('directory:skipped', { directory: dirPath, reason: 'emergency_disabled' });
+    return;
     // USER SETTING: Check if file watching is disabled
     if (!this.isWatchingEnabled()) {
       console.log(`File watching is disabled, skipping watch for ${dirPath}`);

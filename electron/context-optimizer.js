@@ -1,4 +1,4 @@
-import { lightweightContext } from './lightweight-context.js';
+import { workspaceContextManager } from './workspace-context-manager.js';
 export class ContextOptimizer {
     CLAUDE_MAX_TOKENS = 200000;
     WARNING_THRESHOLD = 0.7; // 70% of max
@@ -38,7 +38,11 @@ export class ContextOptimizer {
         const excluded = [];
         let currentTokens = 0;
         // Priority 1: Project overview (minimal tokens)
-        const projectInfo = lightweightContext.getStatistics();
+        const context = workspaceContextManager.getCurrentContext();
+        if (!context) {
+            return { context: '', tokens: 0, included: [], excluded: [] };
+        }
+        const projectInfo = context.getStatistics();
         if (projectInfo) {
             const overview = `PROJECT: ${projectInfo.type} (${projectInfo.framework || 'vanilla'})
 LANGUAGES: ${projectInfo.languages.slice(0, 3).join(', ')}
@@ -75,7 +79,11 @@ FILES: ${projectInfo.totalFiles}`;
         }
         // Priority 3: Relevant files based on query
         if (query && currentTokens < maxTokens * 0.8) {
-            const relevantFiles = await lightweightContext.searchFiles(query, 10);
+            const contextInstance = workspaceContextManager.getCurrentContext();
+            if (!contextInstance) {
+                return { context: '', tokens: 0, included: [], excluded: [] };
+            }
+            const relevantFiles = await contextInstance.searchFiles(query, 10);
             if (relevantFiles.length > 0) {
                 contextParts.push(`\nRELEVANT FILES:`);
                 currentTokens += this.estimateTokens('\nRELEVANT FILES:');
@@ -97,7 +105,11 @@ FILES: ${projectInfo.totalFiles}`;
         }
         // Priority 4: Recent files (if space allows)
         if (currentTokens < maxTokens * 0.7) {
-            const recentFiles = lightweightContext.getRecentFiles(4);
+            const contextInstance = workspaceContextManager.getCurrentContext();
+            if (!contextInstance) {
+                return { context: '', tokens: 0, included: [], excluded: [] };
+            }
+            const recentFiles = contextInstance.getRecentFiles(4);
             if (recentFiles.length > 0) {
                 contextParts.push(`\nRECENT CHANGES:`);
                 currentTokens += this.estimateTokens('\nRECENT CHANGES:');
