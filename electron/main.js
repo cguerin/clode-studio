@@ -11,7 +11,7 @@ import { readFile, mkdir } from 'fs/promises';
 import { watch as chokidarWatch } from 'chokidar';
 import { homedir } from 'os';
 import { claudeCodeService } from './claude-sdk-service.js';
-import { lightweightContext } from './lightweight-context.js';
+import { workspaceContextManager } from './workspace-context-manager.js';
 import { contextOptimizer } from './context-optimizer.js';
 import { workspacePersistence } from './workspace-persistence.js';
 import { searchWithRipgrep } from './search-ripgrep.js';
@@ -33,6 +33,39 @@ import { RelayClient } from './services/relay-client.js';
 // Load environment variables from .env file
 import { config } from 'dotenv';
 config();
+// Memory and error monitoring
+process.on('uncaughtException', async (error) => {
+    console.error('Uncaught Exception:', error);
+    // Try to clean up and save state before crashing
+    try {
+        await workspaceContextManager.closeAllWorkspaces();
+    }
+    catch (e) {
+        console.error('Error during emergency cleanup:', e);
+    }
+    process.exit(1);
+});
+process.on('unhandledRejection', (reason, promise) => {
+    console.error('Unhandled Rejection at:', promise, 'reason:', reason);
+});
+// Monitor memory usage
+setInterval(() => {
+    const usage = process.memoryUsage();
+    const heapUsedMB = usage.heapUsed / 1024 / 1024;
+    if (heapUsedMB > 6000) { // 6GB warning threshold
+        console.warn(`Main process high memory usage: ${heapUsedMB.toFixed(2)}MB`);
+        // Emergency cleanup
+        try {
+            if (global.pendingClaudeOutput) {
+                global.pendingClaudeOutput.clear();
+                console.log('Cleared pending Claude output due to high memory usage');
+            }
+        }
+        catch (error) {
+            console.error('Error during emergency memory cleanup:', error);
+        }
+    }
+}, 60000); // Check every minute
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 let mainWindow = null;
@@ -123,7 +156,8 @@ const startNuxtServer = async () => {
     });
 };
 // Clean up server on quit
-app.on('before-quit', () => {
+app.on('before-quit', async (event) => {
+    event.preventDefault(); // Prevent immediate quit
     if (serverProcess) {
         console.log('Stopping Nuxt server...');
         serverProcess.kill();
@@ -133,6 +167,15 @@ app.on('before-quit', () => {
         console.log('Cleaning up all pending Claude output...');
         global.pendingClaudeOutput.clear();
     }
+    // Clean up workspace contexts
+    try {
+        await workspaceContextManager.shutdown();
+        console.log('Workspace context manager shut down');
+    }
+    catch (error) {
+        console.error('Error shutting down workspace context manager:', error);
+    }
+    app.quit(); // Now actually quit
     // Kill all Claude instances
     claudeInstances.forEach((pty, instanceId) => {
         console.log(`Killing Claude instance ${instanceId}`);
@@ -545,9 +588,38 @@ ipcMain.handle('claude:start', async (event, instanceId, workingDirectory, insta
         // Capture initial output for debugging
         let initialOutput = '';
         let outputTimer = null;
+        // MEMORY LEAK FIX: Target ONLY the specific infinite loop issue, not normal keystrokes
+        let lastLargeMessage = '';
+        let largeMessageCount = 0;
+        let totalDataCount = 0;
+        let lastLogTime = 0;
+        const LARGE_MESSAGE_THRESHOLD = 200; // Only track messages > 200 characters
+        const MAX_IDENTICAL_LARGE_MESSAGES = 100; // Allow many more before blocking
+        const LOG_INTERVAL = 5000; // Log at most every 5 seconds
         // Handle output from Claude
         claudePty.onData((data) => {
-            // Capture first few outputs for debugging
+            totalDataCount++;
+            // TARGETED PROTECTION: Only block large identical messages (the actual memory leak source)
+            if (data.length > LARGE_MESSAGE_THRESHOLD) {
+                if (data === lastLargeMessage) {
+                    largeMessageCount++;
+                    if (largeMessageCount > MAX_IDENTICAL_LARGE_MESSAGES) {
+                        const now = Date.now();
+                        // Only log occasionally to prevent log spam
+                        if (now - lastLogTime > LOG_INTERVAL) {
+                            console.warn(`[MEMORY LEAK FIX] Blocking large message loop for ${instanceId} - ${largeMessageCount} identical ${data.length}-char messages`);
+                            lastLogTime = now;
+                        }
+                        return; // Block only large repeated messages
+                    }
+                }
+                else {
+                    lastLargeMessage = data;
+                    largeMessageCount = 0; // Reset counter on different large message
+                }
+            }
+            // NOTE: Small messages (keystrokes, prompts) are never blocked
+            // Capture first few outputs for debugging (reduced logging)
             if (initialOutput.length < 1000) {
                 initialOutput += data;
                 // Log initial output after a short delay
@@ -559,9 +631,8 @@ ipcMain.handle('claude:start', async (event, instanceId, workingDirectory, insta
                     }
                 }, 500);
             }
-            // Send data with instance ID to all windows
+            // Send data with instance ID to all windows (reduced logging)
             const windows = BrowserWindow.getAllWindows();
-            console.log(`Sending Claude output to frontend for ${instanceId}, length: ${data.length}, windows: ${windows.length}`);
             if (windows.length === 0) {
                 console.warn('No windows available to send Claude output to!');
                 // Store output to send when window becomes available
@@ -569,8 +640,8 @@ ipcMain.handle('claude:start', async (event, instanceId, workingDirectory, insta
                     global.pendingClaudeOutput = new Map();
                 }
                 const pending = global.pendingClaudeOutput.get(instanceId) || '';
-                // Limit pending output to prevent unbounded memory growth (10MB limit)
-                const MAX_PENDING_SIZE = 10 * 1024 * 1024; // 10MB
+                // MUCH SMALLER LIMIT to prevent memory explosion (1MB instead of 10MB)
+                const MAX_PENDING_SIZE = 1 * 1024 * 1024; // 1MB limit
                 const newPending = pending + data;
                 if (newPending.length > MAX_PENDING_SIZE) {
                     // Keep only the last portion of the output
@@ -584,7 +655,6 @@ ipcMain.handle('claude:start', async (event, instanceId, workingDirectory, insta
             else {
                 windows.forEach(window => {
                     if (!window.isDestroyed()) {
-                        console.log(`Sending to window ${window.id}`);
                         window.webContents.send(`claude:output:${instanceId}`, data);
                     }
                 });
@@ -739,24 +809,45 @@ ipcMain.handle('showNotification', async (event, options) => {
 // File Watcher operations
 ipcMain.handle('fileWatcher:start', async (event, dirPath, options) => {
     try {
-        await fileWatcherService.watchDirectory(dirPath, options);
-        // Set up event forwarding to renderer
-        fileWatcherService.on('file:change', (data) => {
+        // Use VERY conservative settings to prevent EMFILE while still allowing functionality
+        console.log(`[Main] Starting conservative file watching for ${dirPath}`);
+        const conservativeOptions = {
+            ...options,
+            usePolling: true, // Force polling to prevent EMFILE
+            interval: 3000, // Poll every 3 seconds
+            depth: 1, // Only watch top level
+            ignored: [
+                '**/node_modules/**',
+                '**/.git/**',
+                '**/dist/**',
+                '**/build/**',
+                '**/.cache/**'
+            ]
+        };
+        await fileWatcherService.watchDirectory(dirPath, conservativeOptions);
+        // MEMORY LEAK FIX: Store listener references for proper cleanup
+        const fileChangeHandler = (data) => {
             const windows = BrowserWindow.getAllWindows();
             windows.forEach(window => {
                 if (!window.isDestroyed()) {
                     window.webContents.send('file:change', data);
                 }
             });
-        });
-        fileWatcherService.on('batch:change', (data) => {
+        };
+        const batchChangeHandler = (data) => {
             const windows = BrowserWindow.getAllWindows();
             windows.forEach(window => {
                 if (!window.isDestroyed()) {
                     window.webContents.send('batch:change', data);
                 }
             });
-        });
+        };
+        // Remove any existing listeners to prevent accumulation
+        fileWatcherService.removeAllListeners('file:change');
+        fileWatcherService.removeAllListeners('batch:change');
+        // Add new listeners
+        fileWatcherService.on('file:change', fileChangeHandler);
+        fileWatcherService.on('batch:change', batchChangeHandler);
         return { success: true };
     }
     catch (error) {
@@ -776,6 +867,63 @@ ipcMain.handle('fileWatcher:indexFile', async (event, filePath) => {
     try {
         const result = await fileWatcherService.performIncrementalIndex(filePath, 'change');
         return { success: true, data: result };
+    }
+    catch (error) {
+        return { success: false, error: error instanceof Error ? error.message : String(error) };
+    }
+});
+// GRACEFUL FALLBACK: IPC handlers for fallback mode
+ipcMain.handle('fileWatcher:getFallbackStatus', async (event) => {
+    try {
+        const status = fileWatcherService.getFallbackStatus();
+        return { success: true, data: status };
+    }
+    catch (error) {
+        return { success: false, error: error instanceof Error ? error.message : String(error) };
+    }
+});
+ipcMain.handle('fileWatcher:resetFallback', async (event) => {
+    try {
+        fileWatcherService.resetFallbackMode();
+        return { success: true };
+    }
+    catch (error) {
+        return { success: false, error: error instanceof Error ? error.message : String(error) };
+    }
+});
+// MANUAL REFRESH: IPC handlers for manual file system refresh
+ipcMain.handle('fileWatcher:manualRefresh', async (event, dirPath) => {
+    try {
+        const result = await fileWatcherService.manualRefresh(dirPath);
+        return { success: true, data: result };
+    }
+    catch (error) {
+        return { success: false, error: error instanceof Error ? error.message : String(error) };
+    }
+});
+ipcMain.handle('fileWatcher:manualRefreshAll', async (event) => {
+    try {
+        const results = await fileWatcherService.manualRefreshAll();
+        return { success: true, data: results };
+    }
+    catch (error) {
+        return { success: false, error: error instanceof Error ? error.message : String(error) };
+    }
+});
+// USER SETTINGS: IPC handlers for file watching configuration
+ipcMain.handle('fileWatcher:getConfiguration', async (event) => {
+    try {
+        const config = fileWatcherService.getWatchingConfiguration();
+        return { success: true, data: config };
+    }
+    catch (error) {
+        return { success: false, error: error instanceof Error ? error.message : String(error) };
+    }
+});
+ipcMain.handle('fileWatcher:setConfiguration', async (event, config) => {
+    try {
+        fileWatcherService.setWatchingConfiguration(config);
+        return { success: true };
     }
     catch (error) {
         return { success: false, error: error instanceof Error ? error.message : String(error) };
@@ -2064,6 +2212,22 @@ Remember: Return ONLY the complete code for the file. No explanations. No markdo
 });
 // Clean up Claude instances on app quit
 app.on('before-quit', async () => {
+    // MEMORY LEAK FIX: Clean up all event listeners first
+    try {
+        fileWatcherService.removeAllListeners();
+        console.log('File watcher event listeners cleaned up');
+    }
+    catch (error) {
+        console.error('Error cleaning up file watcher listeners:', error);
+    }
+    // Shutdown file watchers
+    try {
+        await fileWatcherService.stopAll();
+        console.log('File watchers stopped successfully');
+    }
+    catch (error) {
+        console.error('Failed to stop file watchers:', error);
+    }
     // Shutdown LSP servers
     try {
         const { lspManager } = await import('./lsp-manager.js');
@@ -2358,7 +2522,13 @@ ipcMain.handle('mcp:test', async (event, config) => {
 // Lightweight Context Handlers
 ipcMain.handle('context:initialize', async (event, workspacePath) => {
     try {
-        await lightweightContext.initialize(workspacePath);
+        const context = await workspaceContextManager.getOrCreateContext(workspacePath);
+        // Set up file change notifications to frontend for this workspace
+        context.onFileChange((eventType, filePath) => {
+            if (mainWindow && !mainWindow.isDestroyed()) {
+                mainWindow.webContents.send('context:file-changed', { event: eventType, filePath });
+            }
+        });
         return { success: true };
     }
     catch (error) {
@@ -2370,7 +2540,11 @@ ipcMain.handle('context:initialize', async (event, workspacePath) => {
 });
 ipcMain.handle('context:searchFiles', async (event, query, limit = 20) => {
     try {
-        const results = await lightweightContext.searchFiles(query, limit);
+        const context = workspaceContextManager.getCurrentContext();
+        if (!context) {
+            return { success: false, error: 'No workspace context available' };
+        }
+        const results = await context.searchFiles(query, limit);
         return { success: true, results };
     }
     catch (error) {
@@ -2382,7 +2556,11 @@ ipcMain.handle('context:searchFiles', async (event, query, limit = 20) => {
 });
 ipcMain.handle('context:buildContext', async (event, query, workingFiles, maxTokens = 2000) => {
     try {
-        const context = await lightweightContext.buildContext(query, workingFiles, maxTokens);
+        const contextInstance = workspaceContextManager.getCurrentContext();
+        if (!contextInstance) {
+            return { success: false, error: 'No workspace context available' };
+        }
+        const context = await contextInstance.buildContext(query, workingFiles, maxTokens);
         return { success: true, context };
     }
     catch (error) {
@@ -2394,7 +2572,11 @@ ipcMain.handle('context:buildContext', async (event, query, workingFiles, maxTok
 });
 ipcMain.handle('context:getStatistics', async (event) => {
     try {
-        const statistics = lightweightContext.getStatistics();
+        const context = workspaceContextManager.getCurrentContext();
+        if (!context) {
+            return { success: false, error: 'No workspace context available' };
+        }
+        const statistics = context.getStatistics();
         return { success: true, statistics };
     }
     catch (error) {
@@ -2406,7 +2588,11 @@ ipcMain.handle('context:getStatistics', async (event) => {
 });
 ipcMain.handle('context:getFileContent', async (event, filePath) => {
     try {
-        const content = await lightweightContext.getFileContent(filePath);
+        const context = workspaceContextManager.getCurrentContext();
+        if (!context) {
+            return { success: false, error: 'No workspace context available' };
+        }
+        const content = await context.getFileContent(filePath);
         return { success: true, content };
     }
     catch (error) {
@@ -2418,7 +2604,11 @@ ipcMain.handle('context:getFileContent', async (event, filePath) => {
 });
 ipcMain.handle('context:getRecentFiles', async (event, hours = 24) => {
     try {
-        const files = lightweightContext.getRecentFiles(hours);
+        const context = workspaceContextManager.getCurrentContext();
+        if (!context) {
+            return { success: false, error: 'No workspace context available' };
+        }
+        const files = context.getRecentFiles(hours);
         return { success: true, files };
     }
     catch (error) {
@@ -2430,7 +2620,11 @@ ipcMain.handle('context:getRecentFiles', async (event, hours = 24) => {
 });
 ipcMain.handle('context:rescan', async (event) => {
     try {
-        await lightweightContext.scanWorkspace();
+        const context = workspaceContextManager.getCurrentContext();
+        if (!context) {
+            return { success: false, error: 'No workspace context available' };
+        }
+        await context.scanWorkspace();
         return { success: true };
     }
     catch (error) {
@@ -2442,7 +2636,11 @@ ipcMain.handle('context:rescan', async (event) => {
 });
 ipcMain.handle('context:startWatching', async (event) => {
     try {
-        lightweightContext.startWatching();
+        const context = workspaceContextManager.getCurrentContext();
+        if (!context) {
+            return { success: false, error: 'No workspace context available' };
+        }
+        context.startWatching();
         return { success: true };
     }
     catch (error) {
@@ -2454,7 +2652,11 @@ ipcMain.handle('context:startWatching', async (event) => {
 });
 ipcMain.handle('context:stopWatching', async (event) => {
     try {
-        lightweightContext.stopWatching();
+        const context = workspaceContextManager.getCurrentContext();
+        if (!context) {
+            return { success: false, error: 'No workspace context available' };
+        }
+        context.stopWatching();
         return { success: true };
     }
     catch (error) {
@@ -2464,12 +2666,62 @@ ipcMain.handle('context:stopWatching', async (event) => {
         };
     }
 });
-// Set up file change notifications to frontend
-lightweightContext.onFileChange((event, filePath) => {
-    if (mainWindow) {
-        mainWindow.webContents.send('context:file-changed', { event, filePath });
+// Memory leak detection and monitoring handlers
+ipcMain.handle('context:detectMemoryLeaks', async (event) => {
+    try {
+        const context = workspaceContextManager.getCurrentContext();
+        if (!context) {
+            return { success: false, error: 'No workspace context available' };
+        }
+        const leakReport = context.detectMemoryLeaks();
+        return { success: true, leakReport };
+    }
+    catch (error) {
+        return {
+            success: false,
+            error: error instanceof Error ? error.message : 'Failed to detect memory leaks'
+        };
     }
 });
+ipcMain.handle('context:getMemoryStats', async (event) => {
+    try {
+        const context = workspaceContextManager.getCurrentContext();
+        if (!context) {
+            return { success: false, error: 'No workspace context available' };
+        }
+        const memoryStats = context.getMemoryStats();
+        const managerStats = workspaceContextManager.getStats();
+        return {
+            success: true,
+            memoryStats,
+            managerStats
+        };
+    }
+    catch (error) {
+        return {
+            success: false,
+            error: error instanceof Error ? error.message : 'Failed to get memory stats'
+        };
+    }
+});
+ipcMain.handle('context:forceCleanup', async (event) => {
+    try {
+        const context = workspaceContextManager.getCurrentContext();
+        if (!context) {
+            return { success: false, error: 'No workspace context available' };
+        }
+        const removedCount = context.forceCleanup();
+        return { success: true, removedCount };
+    }
+    catch (error) {
+        return {
+            success: false,
+            error: error instanceof Error ? error.message : 'Failed to force cleanup'
+        };
+    }
+});
+// Set up file change notifications to frontend - handled by individual contexts now
+// This will be set up when workspaces are initialized
 // Context optimization handlers
 ipcMain.handle('context:analyzeUsage', async (event, messages, currentContext) => {
     try {
