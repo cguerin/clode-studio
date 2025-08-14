@@ -1,7 +1,9 @@
 import { readdir, stat, readFile } from 'fs/promises';
 import { join, extname, basename, dirname, relative } from 'path';
-import { existsSync, watch, FSWatcher } from 'fs';
+import { existsSync } from 'fs';
 import { workspacePersistence } from './workspace-persistence.js';
+import { LRUCache } from './lru-cache.js';
+import { fileWatcherService, FileChangeEvent } from './file-watcher.js';
 
 export interface FileInfo {
   path: string;
@@ -32,14 +34,24 @@ export interface ContextResult {
 
 export class LightweightContext {
   private workspacePath: string = '';
-  private fileCache: Map<string, FileInfo> = new Map();
+  private fileCache: LRUCache<string, FileInfo>;
   private projectInfo: ProjectInfo | null = null;
   private lastScanTime: number = 0;
+  private isDestroyed: boolean = false;
   
-  // File watching
-  private watchers: Map<string, FSWatcher> = new Map();
-  private watcherCallbacks: Set<(event: 'add' | 'change' | 'remove', filePath: string) => void> = new Set();
+  // File watching - now uses centralized watcher service
+  private watcherCallbacks: Map<string, (event: 'add' | 'change' | 'remove', filePath: string) => void> = new Map();
+  private fileWatcherCleanup: (() => void) | null = null;
+  private callbackIdCounter: number = 0;
   private scanDebounceTimer: NodeJS.Timeout | null = null;
+  
+  // Memory management - VERY conservative limits to prevent EMFILE
+  private readonly MAX_FILES = 300; // LRU cache limit - much lower to prevent EMFILE
+  private readonly MAX_FILE_SIZE = 512 * 1024; // 512KB per file
+  private readonly MAX_CACHE_AGE = 30 * 60 * 1000; // 30 minutes
+  private readonly MEMORY_CHECK_INTERVAL = 5000; // 5 seconds
+  private readonly MEMORY_THRESHOLD = 200 * 1024 * 1024; // 200MB threshold
+  private memoryMonitorInterval: NodeJS.Timeout | null = null;
   
   // Common file extensions and their languages
   private languageMap: Record<string, string> = {
@@ -72,33 +84,112 @@ export class LightweightContext {
     '.sql': 'sql'
   };
 
-  // Files to ignore
+  // Files to ignore - comprehensive list for large workspaces
   private ignorePatterns = [
+    // Dependencies
     'node_modules',
+    'vendor',
+    'packages',
+    '.pnpm-store',
+    
+    // Version control
     '.git',
+    '.svn',
+    '.hg',
+    
+    // Claude/IDE specific
     '.claude',
     '.claude-checkpoints',
     '.clode',
     '.worktrees',
-    'dist',
-    'build',
-    '.output',
-    'coverage',
-    '.nyc_output',
-    'tmp',
-    'temp',
-    '.cache',
-    '.parcel-cache',
     '.vscode',
     '.idea',
+    '*.swp',
+    '*.swo',
+    
+    // Build outputs
+    'dist',
+    'build',
+    'out',
+    '.output',
+    '.next',
+    'public/build',
+    'target',
+    'bin',
+    'obj',
+    
+    // Logs and temp files
+    'logs',
+    '*.log',
+    'tmp',
+    'temp',
+    '.tmp',
+    '.temp',
+    
+    // Cache directories
+    '.cache',
+    '.parcel-cache',
+    '.nuxt',
+    '.turbo',
+    '.webpack',
+    
+    // Test coverage
+    'coverage',
+    '.nyc_output',
+    '.coverage',
+    'htmlcov',
+    
+    // Language specific
     '__pycache__',
     '*.pyc',
-    '.DS_Store'
+    '*.pyo',
+    '*.class',
+    '*.o',
+    '*.so',
+    '*.dll',
+    '*.exe',
+    
+    // OS files
+    '.DS_Store',
+    'Thumbs.db',
+    'desktop.ini',
+    
+    // Large media files
+    '*.mp4',
+    '*.avi',
+    '*.mov',
+    '*.wmv',
+    '*.mp3',
+    '*.wav',
+    '*.flac',
+    '*.zip',
+    '*.rar',
+    '*.7z',
+    '*.tar.gz',
+    '*.dmp',
+    '*.dump'
   ];
 
+  constructor() {
+    // Initialize LRU cache with conservative limits
+    this.fileCache = new LRUCache<string, FileInfo>(this.MAX_FILES, this.MAX_CACHE_AGE);
+  }
+
   async initialize(workspacePath: string): Promise<void> {
+    if (this.isDestroyed) {
+      throw new Error('Cannot initialize destroyed LightweightContext instance');
+    }
+
     // Stop any existing watchers
     this.stopWatching();
+    
+    // Validate workspace path exists
+    if (!workspacePath || !existsSync(workspacePath)) {
+      throw new Error(`Workspace path does not exist: ${workspacePath}`);
+    }
+    
+    // Validate that this isn't a parent directory containing multiple projects
+    await this.validateWorkspacePath(workspacePath);
     
     this.workspacePath = workspacePath;
     
@@ -120,10 +211,17 @@ export class LightweightContext {
     }
     
     // Start watching for file changes
-    this.startWatching();
+    this.startWatching().catch(error => {
+      console.warn('Failed to start file watching during initialization:', error);
+    });
+    
+    // Start memory monitoring
+    this.startMemoryMonitor();
   }
 
   async scanWorkspace(): Promise<void> {
+    if (this.isDestroyed) return;
+    
     const startTime = Date.now();
     
     this.fileCache.clear();
@@ -132,10 +230,13 @@ export class LightweightContext {
     // Build project info
     this.projectInfo = this.analyzeProject(files);
     this.lastScanTime = Date.now();
+    
+    console.log(`Workspace scan completed in ${Date.now() - startTime}ms, found ${files.length} files`);
   }
 
   private async scanDirectory(dirPath: string, depth: number = 0): Promise<FileInfo[]> {
     if (depth > 8) return []; // Prevent infinite recursion
+    if (this.isDestroyed) return [];
     
     const files: FileInfo[] = [];
     const relativePath = relative(this.workspacePath, dirPath);
@@ -145,38 +246,74 @@ export class LightweightContext {
       return files;
     }
 
+    // Validate directory exists before scanning
+    if (!existsSync(dirPath)) {
+      console.warn(`Directory does not exist, skipping: ${dirPath}`);
+      return files;
+    }
+
     try {
       const entries = await readdir(dirPath);
       
-      for (const entry of entries) {
-        const fullPath = join(dirPath, entry);
-        const stats = await stat(fullPath);
+      // Process entries in batches to avoid memory spikes
+      const BATCH_SIZE = 50;
+      for (let i = 0; i < entries.length; i += BATCH_SIZE) {
+        if (this.isDestroyed) break;
         
-        if (stats.isDirectory()) {
-          // Recursively scan subdirectories
-          const subFiles = await this.scanDirectory(fullPath, depth + 1);
-          files.push(...subFiles);
-        } else {
-          // Process file
-          const ext = extname(entry).toLowerCase();
-          const language = this.languageMap[ext] || 'unknown';
+        const batch = entries.slice(i, i + BATCH_SIZE);
+        const batchPromises = batch.map(async (entry) => {
+          const fullPath = join(dirPath, entry);
           
-          // Skip binary files and very large files
-          if (stats.size > 1024 * 1024 || this.isBinaryFile(entry)) {
-            continue;
+          try {
+            const stats = await stat(fullPath);
+            
+            if (stats.isDirectory()) {
+              // Recursively scan subdirectories
+              return await this.scanDirectory(fullPath, depth + 1);
+            } else {
+              // Process file
+              const ext = extname(entry).toLowerCase();
+              const language = this.languageMap[ext] || 'unknown';
+              
+              // Skip binary files and very large files
+              if (stats.size > this.MAX_FILE_SIZE || this.isBinaryFile(entry)) {
+                return [];
+              }
+              
+              // Check file count limit to prevent memory issues
+              if (this.fileCache.size() >= this.MAX_FILES) {
+                console.warn(`File limit reached (${this.MAX_FILES}), stopping directory scan`);
+                return [];
+              }
+
+              const fileInfo: FileInfo = {
+                path: fullPath,
+                name: entry,
+                size: stats.size,
+                language,
+                lastModified: stats.mtime,
+                isDirectory: false
+              };
+
+              // Add to cache immediately to keep memory usage bounded
+              this.fileCache.set(fullPath, fileInfo);
+              return [fileInfo];
+            }
+          } catch (error) {
+            console.warn(`Error processing entry ${fullPath}:`, error);
+            return [];
           }
-
-          const fileInfo: FileInfo = {
-            path: fullPath,
-            name: entry,
-            size: stats.size,
-            language,
-            lastModified: stats.mtime,
-            isDirectory: false
-          };
-
-          files.push(fileInfo);
-          this.fileCache.set(fullPath, fileInfo);
+        });
+        
+        // Process batch and flatten results
+        const batchResults = await Promise.all(batchPromises);
+        for (const result of batchResults) {
+          files.push(...result);
+        }
+        
+        // Yield control periodically to prevent blocking
+        if (i + BATCH_SIZE < entries.length) {
+          await new Promise(resolve => setImmediate(resolve));
         }
       }
     } catch (error) {
@@ -296,8 +433,50 @@ export class LightweightContext {
     return undefined;
   }
 
+  private async validateWorkspacePath(workspacePath: string): Promise<void> {
+    try {
+      const entries = await readdir(workspacePath);
+      let projectLikeDirs = 0;
+      
+      // Check for multiple project-like subdirectories
+      for (const entry of entries) {
+        const fullPath = join(workspacePath, entry);
+        const stats = await stat(fullPath);
+        
+        if (stats.isDirectory() && !this.shouldIgnore(entry)) {
+          // Check if this directory looks like a project
+          const projectFiles = ['package.json', 'pom.xml', 'Cargo.toml', 'requirements.txt', 
+                               'go.mod', 'Gemfile', 'composer.json', '.git'];
+          
+          for (const projectFile of projectFiles) {
+            if (existsSync(join(fullPath, projectFile))) {
+              projectLikeDirs++;
+              break;
+            }
+          }
+        }
+      }
+      
+      // If we found multiple project-like directories, this might be a parent directory
+      if (projectLikeDirs >= 3) {
+        console.warn(`Warning: Workspace path "${workspacePath}" contains ${projectLikeDirs} project-like directories. This might cause excessive memory usage.`);
+        // VERY conservative limits for multiple projects to prevent EMFILE
+        (this as any).MAX_FILES = Math.min(this.MAX_FILES, 200);
+        console.warn(`Reduced MAX_FILES to ${(this as any).MAX_FILES} to prevent EMFILE errors.`);
+      } else if (projectLikeDirs === 1) {
+        // Single large project - use VERY conservative limits to prevent EMFILE
+        (this as any).MAX_FILES = Math.min(this.MAX_FILES, 500);
+        console.log(`Detected single large project, reduced MAX_FILES to ${(this as any).MAX_FILES} to prevent EMFILE errors.`);
+      }
+    } catch (error) {
+      console.warn('Failed to validate workspace path:', error);
+    }
+  }
+
   // Fast file search using simple text matching
   async searchFiles(query: string, limit: number = 20): Promise<FileInfo[]> {
+    if (this.isDestroyed) return [];
+    
     const results: FileInfo[] = [];
     const queryLower = query.toLowerCase();
 
@@ -428,60 +607,75 @@ export class LightweightContext {
 
   // Get files by language
   getFilesByLanguage(language: string): FileInfo[] {
+    if (this.isDestroyed) return [];
     return Array.from(this.fileCache.values())
       .filter(file => file.language === language);
   }
 
   // Get recently modified files
   getRecentFiles(hours: number = 24): FileInfo[] {
+    if (this.isDestroyed) return [];
     const cutoff = Date.now() - (hours * 60 * 60 * 1000);
     return Array.from(this.fileCache.values())
       .filter(file => file.lastModified.getTime() > cutoff)
       .sort((a, b) => b.lastModified.getTime() - a.lastModified.getTime());
   }
 
-  // File watching methods
-  startWatching(): void {
-    if (!this.workspacePath) return;
+  // File watching methods - now uses centralized FileWatcherService
+  async startWatching(): Promise<void> {
+    if (!this.workspacePath || this.isDestroyed) return;
     
     try {
-      // Watch the workspace directory
-      const watcher = watch(this.workspacePath, { recursive: true }, (eventType, filename) => {
-        if (!filename) return;
-        
-        const fullPath = join(this.workspacePath, filename);
-        
-        // Skip ignored files/directories
-        if (this.shouldIgnore(filename) || this.isBinaryFile(filename)) {
-          return;
+      // Set up file watching with VERY conservative settings to prevent EMFILE
+      console.log(`[LightweightContext] Starting conservative file watching for ${this.workspacePath}`);
+      
+      await fileWatcherService.watchDirectory(this.workspacePath, {
+        ignored: this.ignorePatterns.map(pattern => `**/${pattern}/**`),
+        depth: 0, // EMERGENCY: Only watch workspace root to prevent EMFILE and memory leaks
+        usePolling: true, // Force polling to avoid native file descriptor limits
+        interval: 5000 // Poll every 5 seconds (much slower but safer)
+      });
+
+      // Register for file change events
+      const handleFileChange = (data: { directory: string; event: FileChangeEvent }) => {
+        if (data.directory === this.workspacePath) {
+          this.handleFileSystemEvent(data.event.type, data.event.path);
         }
-        
-        this.handleFileSystemEvent(eventType, fullPath);
-      });
+      };
+
+      // Remove any existing listeners first to prevent accumulation
+      if (this.fileWatcherCleanup) {
+        this.fileWatcherCleanup();
+        this.fileWatcherCleanup = null;
+      }
       
-      this.watchers.set(this.workspacePath, watcher);
+      fileWatcherService.on('file:change', handleFileChange);
       
-      watcher.on('error', (error) => {
-        console.warn('File watcher error:', error);
-        this.stopWatching();
-      });
+      // Store cleanup function with enhanced cleanup
+      this.fileWatcherCleanup = () => {
+        fileWatcherService.off('file:change', handleFileChange);
+        console.log(`[LightweightContext] Cleaned up file watcher for ${this.workspacePath}`);
+      };
+      
+      console.log(`[LightweightContext] Emergency file watching enabled (polling mode, depth=0, root only)`);
       
     } catch (error) {
       console.warn('Failed to start file watching:', error);
+      console.warn('File watching disabled, IDE will work but won\'t auto-detect file changes');
     }
   }
   
   stopWatching(): void {
-    
-    for (const [path, watcher] of this.watchers) {
-      try {
-        watcher.close();
-      } catch (error) {
-        console.warn(`Failed to close watcher for ${path}:`, error);
-      }
+    // Clean up file watcher event listener
+    if (this.fileWatcherCleanup) {
+      this.fileWatcherCleanup();
+      this.fileWatcherCleanup = null;
     }
     
-    this.watchers.clear();
+    // Stop watching this workspace directory
+    if (this.workspacePath) {
+      fileWatcherService.unwatchDirectory(this.workspacePath);
+    }
     
     // Clear debounce timer
     if (this.scanDebounceTimer) {
@@ -490,7 +684,7 @@ export class LightweightContext {
     }
   }
   
-  private handleFileSystemEvent(eventType: string, filePath: string): void {
+  private handleFileSystemEvent(eventType: 'add' | 'change' | 'unlink', filePath: string): void {
     // Debounce rapid file system events
     if (this.scanDebounceTimer) {
       clearTimeout(this.scanDebounceTimer);
@@ -500,19 +694,14 @@ export class LightweightContext {
       try {
         const relativePath = relative(this.workspacePath, filePath);
         
-        if (eventType === 'rename') {
-          // File was added or removed
-          const exists = existsSync(filePath);
-          
-          if (exists) {
-            // File added
-            await this.addFileToCache(filePath);
-            this.notifyWatchers('add', filePath);
-          } else {
-            // File removed
-            this.removeFileFromCache(filePath);
-            this.notifyWatchers('remove', filePath);
-          }
+        if (eventType === 'add') {
+          // File added
+          await this.addFileToCache(filePath);
+          this.notifyWatchers('add', filePath);
+        } else if (eventType === 'unlink') {
+          // File removed
+          this.removeFileFromCache(filePath);
+          this.notifyWatchers('remove', filePath);
         } else if (eventType === 'change') {
           // File modified
           if (this.fileCache.has(filePath)) {
@@ -578,23 +767,40 @@ export class LightweightContext {
     this.projectInfo = this.analyzeProject(files);
   }
   
-  // Callback management for UI notifications
+  // Callback management for UI notifications with unique IDs
   onFileChange(callback: (event: 'add' | 'change' | 'remove', filePath: string) => void): () => void {
-    this.watcherCallbacks.add(callback);
+    const callbackId = `callback_${++this.callbackIdCounter}_${Date.now()}`;
+    this.watcherCallbacks.set(callbackId, callback);
     
     // Return cleanup function
     return () => {
-      this.watcherCallbacks.delete(callback);
+      this.watcherCallbacks.delete(callbackId);
     };
   }
   
   private notifyWatchers(event: 'add' | 'change' | 'remove', filePath: string): void {
-    for (const callback of this.watcherCallbacks) {
+    if (this.isDestroyed) return;
+    
+    // Clean up any callbacks that might have been orphaned
+    const deadCallbacks: string[] = [];
+    
+    for (const [callbackId, callback] of this.watcherCallbacks) {
       try {
-        callback(event, filePath);
+        // Check if callback is still valid (not a stale reference)
+        if (typeof callback === 'function') {
+          callback(event, filePath);
+        } else {
+          deadCallbacks.push(callbackId);
+        }
       } catch (error) {
-        console.warn('Error in file watcher callback:', error);
+        console.warn(`Error in file watcher callback ${callbackId}:`, error);
+        deadCallbacks.push(callbackId);
       }
+    }
+    
+    // Remove dead callbacks
+    for (const callbackId of deadCallbacks) {
+      this.watcherCallbacks.delete(callbackId);
     }
   }
 
@@ -622,14 +828,221 @@ export class LightweightContext {
     }
   }
 
-  // Enhanced cleanup
+  // Memory monitoring - now much more frequent and aggressive
+  private startMemoryMonitor(): void {
+    if (this.isDestroyed) return;
+    
+    // Clear any existing monitor to prevent multiple intervals
+    this.stopMemoryMonitor();
+    
+    this.memoryMonitorInterval = setInterval(() => {
+      if (this.isDestroyed) {
+        this.stopMemoryMonitor();
+        return;
+      }
+      
+      const usage = process.memoryUsage();
+      const heapUsedMB = usage.heapUsed / 1024 / 1024;
+      const heapTotalMB = usage.heapTotal / 1024 / 1024;
+      const cacheSize = this.fileCache.size();
+      const cacheStats = this.fileCache.getStats();
+      
+      // Log memory usage every 30 seconds (but check every 5)
+      if (Date.now() % 30000 < this.MEMORY_CHECK_INTERVAL) {
+        console.log(`Memory Usage - Heap Used: ${heapUsedMB.toFixed(2)}MB, Heap Total: ${heapTotalMB.toFixed(2)}MB, Files Cached: ${cacheSize}, Hit Rate: ${(cacheStats.hitRate * 100).toFixed(1)}%`);
+      }
+      
+      // Emergency cleanup if memory usage is too high
+      if (usage.heapUsed > this.MEMORY_THRESHOLD) {
+        console.warn(`High memory usage detected (${heapUsedMB.toFixed(2)}MB), performing emergency cleanup...`);
+        this.emergencyCleanup();
+        
+        // Force garbage collection if available
+        if (global.gc) {
+          global.gc();
+          console.log('Forced garbage collection');
+        }
+      }
+    }, this.MEMORY_CHECK_INTERVAL); // Check every 5 seconds
+  }
+  
+  private stopMemoryMonitor(): void {
+    if (this.memoryMonitorInterval) {
+      clearInterval(this.memoryMonitorInterval);
+      this.memoryMonitorInterval = null;
+    }
+  }
+  
+  private emergencyCleanup(): void {
+    if (this.isDestroyed) return;
+    
+    console.log('Performing emergency memory cleanup...');
+    
+    const sizeBefore = this.fileCache.size();
+    
+    // Force LRU cache cleanup first
+    const expiredRemoved = this.fileCache.forceCleanup();
+    
+    // If still too many files, clear most of the cache
+    if (this.fileCache.size() > 50) {
+      // Keep only the most recently accessed files
+      const entries = this.fileCache.entries();
+      this.fileCache.clear();
+      
+      // Re-add only the first 50 entries (most recently used due to LRU)
+      let kept = 0;
+      for (const [path, file] of entries) {
+        if (kept < 50) {
+          const isConfig = this.isConfigFile(file.name) || this.isEntryPoint(file.name);
+          if (isConfig || kept < 30) {
+            this.fileCache.set(path, file);
+            kept++;
+          }
+        } else {
+          break;
+        }
+      }
+    }
+    
+    // Clear any pending timers
+    if (this.scanDebounceTimer) {
+      clearTimeout(this.scanDebounceTimer);
+      this.scanDebounceTimer = null;
+    }
+    
+    const sizeAfter = this.fileCache.size();
+    console.log(`Emergency cleanup completed: ${sizeBefore} -> ${sizeAfter} files (removed ${sizeBefore - sizeAfter}, expired ${expiredRemoved})`);
+  }
+
+  // Enhanced cleanup - now properly destroys the instance
   cleanup(): void {
+    if (this.isDestroyed) return;
+    
+    console.log(`Cleaning up LightweightContext for workspace: ${this.workspacePath}`);
+    
+    this.isDestroyed = true;
     this.stopWatching();
+    this.stopMemoryMonitor();
     this.fileCache.clear();
     this.projectInfo = null;
     this.watcherCallbacks.clear();
+    
+    // Clear any pending timers
+    if (this.scanDebounceTimer) {
+      clearTimeout(this.scanDebounceTimer);
+      this.scanDebounceTimer = null;
+    }
+  }
+
+  // Get cache size for monitoring
+  getCacheSize(): number {
+    return this.fileCache.size();
+  }
+
+  // Get cache statistics
+  getCacheStats(): any {
+    return this.fileCache.getStats();
+  }
+
+  // Force cache cleanup
+  forceCleanup(): number {
+    if (this.isDestroyed) return 0;
+    return this.fileCache.forceCleanup();
+  }
+
+  // Check if instance is destroyed
+  isInstanceDestroyed(): boolean {
+    return this.isDestroyed;
+  }
+
+  // Memory leak detection
+  detectMemoryLeaks(): {
+    potentialLeaks: string[];
+    recommendations: string[];
+    severity: 'low' | 'medium' | 'high';
+  } {
+    const issues: string[] = [];
+    const recommendations: string[] = [];
+    
+    // Check callback count
+    const callbackCount = this.watcherCallbacks.size;
+    if (callbackCount > 10) {
+      issues.push(`Too many file watcher callbacks: ${callbackCount} (expected < 10)`);
+      recommendations.push('Review file watcher callback management');
+    }
+    
+    // Check cache size vs limits
+    const cacheSize = this.fileCache.size();
+    const cacheUtilization = (cacheSize / this.MAX_FILES) * 100;
+    if (cacheUtilization > 90) {
+      issues.push(`Cache nearly full: ${cacheSize}/${this.MAX_FILES} files (${cacheUtilization.toFixed(1)}%)`);
+      recommendations.push('Consider increasing cache limits or reducing workspace scope');
+    }
+    
+    // Check for stale timers
+    if (this.scanDebounceTimer !== null) {
+      issues.push('Scan debounce timer still active');
+      recommendations.push('Ensure proper timer cleanup in all code paths');
+    }
+    
+    // Check memory monitor status
+    if (this.memoryMonitorInterval !== null && this.isDestroyed) {
+      issues.push('Memory monitor still running on destroyed instance');
+      recommendations.push('Fix cleanup sequence to stop monitoring before destruction');
+    }
+    
+    // Check file watcher cleanup
+    if (this.fileWatcherCleanup !== null && this.isDestroyed) {
+      issues.push('File watcher cleanup function not called');
+      recommendations.push('Ensure file watcher cleanup is called in destruction sequence');
+    }
+    
+    // Determine severity
+    let severity: 'low' | 'medium' | 'high' = 'low';
+    if (issues.length > 5) {
+      severity = 'high';
+    } else if (issues.length > 2) {
+      severity = 'medium';
+    }
+    
+    return {
+      potentialLeaks: issues,
+      recommendations,
+      severity
+    };
+  }
+
+  // Get detailed memory statistics
+  getMemoryStats(): {
+    heapUsed: number;
+    heapTotal: number;
+    cacheSize: number;
+    callbackCount: number;
+    timersActive: number;
+    isDestroyed: boolean;
+  } {
+    const usage = process.memoryUsage();
+    
+    return {
+      heapUsed: usage.heapUsed,
+      heapTotal: usage.heapTotal,
+      cacheSize: this.fileCache.size(),
+      callbackCount: this.watcherCallbacks.size,
+      timersActive: (this.scanDebounceTimer ? 1 : 0) + (this.memoryMonitorInterval ? 1 : 0),
+      isDestroyed: this.isDestroyed
+    };
   }
 }
 
-// Global instance
-export const lightweightContext = new LightweightContext();
+// Factory function for creating new instances
+export function createLightweightContext(): LightweightContext {
+  return new LightweightContext();
+}
+
+// For backward compatibility during transition, export a function that gets the current workspace context
+// This will be removed once all callers are updated to use the WorkspaceContextManager
+export function getLightweightContext(): LightweightContext | null {
+  console.warn('DEPRECATED: getLightweightContext() is deprecated. Use workspaceContextManager.getCurrentContext() instead.');
+  const { workspaceContextManager } = require('./workspace-context-manager.js');
+  return workspaceContextManager.getCurrentContext();
+}
