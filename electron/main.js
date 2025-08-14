@@ -58,10 +58,21 @@ function setupGlobalIPCTracking(window) {
             console.error(`[EMERGENCY] Blocking ALL IPC after ${globalIPCCount}. Channel: ${channel}`);
             return;
         }
-        // Detect specific channel flooding - but only block OUTPUT channels, not input
+        // SMART BLOCKING: Only block if channel is truly flooded AND we're in an infinite loop
         if (ipcChannelCounts[channel] > 5000 && channel.includes('claude:output:')) {
-            console.error(`[CHANNEL FLOOD] Blocking OUTPUT channel ${channel} after ${ipcChannelCounts[channel]} messages`);
-            return;
+            // Extract instance ID from channel name
+            const instanceId = channel.split(':').pop();
+            if (instanceId && global.claudeMessageTracking) {
+                const tracking = global.claudeMessageTracking.get(instanceId);
+                // Only block if we're actually in an infinite loop, not just high activity
+                if (tracking && tracking.blocked && tracking.identicalCount > 10) {
+                    console.error(`[CHANNEL FLOOD] Blocking OUTPUT channel ${channel} - infinite loop detected (${tracking.identicalCount} identical messages)`);
+                    return;
+                } else {
+                    // High message count but not an infinite loop - allow through with warning
+                    console.warn(`[CHANNEL BUSY] High activity on ${channel} (${ipcChannelCounts[channel]} messages) but no infinite loop detected - allowing`);
+                }
+            }
         }
         return originalSend(channel, ...args);
     };
